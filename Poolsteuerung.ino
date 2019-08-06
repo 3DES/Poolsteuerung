@@ -56,17 +56,27 @@
  *
  *
  *   Arduino NANO
- *
+ *     3 2 2 2 2 2 2 2 2 2 2 1 1 1 1
+ *     0 9 8 7 6 5 4 3 2 1 0 9 8 7 6
  *    +-----------------------------+
- *    |o o o o o o o o o o o o o o o|
- *    |                         ISP |
- *    +-+                  GND  o o | -RESET (30)
- *    | | USB             MOSI  o o | SCK    (20) [PB1/PCINT1/SCK]                  MOSI (21) [PB2/PCINT2/MOSI]
- *    +-+                   5V  o x | MISO   (22) [PB3/PCINT3/MISO]
- *    |                             |
+ *    |o o o o o o o o o o o o o o o|                                       ISP
+ *    |                [TX]     ISP |                                      +---+
+ *    +-+              [RX]     o o |                                  GND |o o| -RESET
+ *    | | USB   [RESET]         o o |             [PB2/PCINT2/MOSI]   MOSI |o o| SCK  [PB1/PCINT1/SCK]
+ *    +-+              [PWR]    o x |                                   5V |o x| MISO [PB3/PCINT3/MISO]
+ *    |                [D13]        |                                      +---+
  *    |o o o o o o o o o o o o o o o|
  *    +-----------------------------+
+ *     1 2 3 4 5 6 7 8 9 1 1 1 1 1 1
+ *                       0 1 2 3 4 5
  *
+ *
+ *     1: D13 (on board LED)       7: A3       13: RESET          19: GND        25: D7
+ *     2: 3V3                      8: A4       14: GND            20: D2         26: D8
+ *     3: Ana.REF                  9: A5       15: VIN (<=8V)     21: D3         27: D9
+ *     4: A0                      10: A6       16: TXD            22: D4         28: D10
+ *     5: A1                      11: A7       17: RXD            23: D5         29: D11
+ *     6: A2                      12: 5V       18: RESET          24: D6         30: D12
  *
  *
  *
@@ -139,7 +149,7 @@
 #define D1   1              // TX
 #define D2   2              // one wire bus
 #define D3   3              // pump ON + heater valve closed (closed means water is pumped to the roof)
-#define D4   4              // 
+#define D4   4              //
 #define D5   5              // set to low increases water temp by 5°C (for debugging)
 #define D6   6              // set to low increases roof  temp by 5°C (for debugging)
 #define D7   7              // LED red   "heizen"
@@ -184,11 +194,12 @@ enum {
  * some constant values
  */
 enum {
-    eTempHysteresis    = 300,  // don't start pump until temp > temp +/- hysteresis has been reached (unit: 1/100°C)
-    eTempFrost         = 5,    // show frost when this temp or less has been reached
-                       
-    eTempSamples       = 6,    // amount of temp samples (must be 2^n+2 because of sort and median algorithm!)
-    eStateMedian       = eTempSamples,
+    eTempHysteresis      = 300,  // don't start pump until temp > temp +/- hysteresis has been reached (unit: 1/100°C)
+    eTempMatchHysteresis = 50,   // show "match" when water temp within set temp +/- match hysteresis (+/- 0.5°C)
+    eTempFrost           = 5,    // show frost when this temp or less has been reached
+
+    eTempSamples         = 6,    // amount of temp samples (must be 2^n+2 because of sort and median algorithm!)
+    eStateMedian         = eTempSamples,
     eStateConversion,
     eStateOneWire,
     eStateAction,
@@ -201,16 +212,16 @@ enum {
  */
 typedef enum {
     eError_none = 0,
-    eError_0001 = 0x0001,     // array length not as expected
-    eError_0002 = 0x0002,     // unexpected state reached
+    eError_0001 = 0x0001,     // unexpected length for array to be sorted
+    eError_0002 = 0x0002,     // unexpected state reached in state machine
     eError_0003 = 0x0003,     // given ADC value is smaller than given lowTempDegree  and sensor is NTC
     eError_0004 = 0x0004,     // given ADC value is larger  than given highTempDegree and sensor is NTC
     eError_0005 = 0x0005,     // given ADC value is larger  than given lowTempDegree  and sensor is PTC
     eError_0006 = 0x0006,     // given ADC value is smaller than given highTempDegree and sensor is PTC
-    eError_0007 = 0x0007,     // initial ds18b20 scan received message with CRC error
+    eError_0007 = 0x0007,     // CRC error while initially scan for ds18b20
     eError_0008 = 0x0008,     // unknown ds18b20 found
-    eError_0009 = 0x0009,     // roof sensor not found
-    eError_000A = 0x000A,     // water sensor not found
+    eError_0009 = 0x0009,     // roof sensor missed
+    eError_000A = 0x000A,     // water sensor missed
     eError_000B = 0x000B,     // CRC error while reading temperature from sensor
     eError_000C = 0x000C,     // sensor data in initialization phase was completely zero (DS18B20 CRC is worthless if e.g. pull-up fails, then all data is 0x00 and CRC is also 0x00)
     eError_000D = 0x000D,     // sensor data while reading temperature from sensor was completely zero (DS18B20 CRC is worthless if e.g. pull-up fails, then all data is 0x00 and CRC is also 0x00)
@@ -222,20 +233,20 @@ typedef enum {
  */
 enum {
     eTempPinSet      = A0,      // pin for set temp
-                        
+
     eOutPinOneWire   = D2,      // one wire pin (to setup temperature values)
     eOutPinPump      = D3,      // pin for pump relais
 
-    eInPinDebugWater = D4,      
+    eInPinDebugWater = D4,
     eInPinDebugRoof  = D5,
 
     eLedPinHeat      = D7,      // LED pin for heating
     eLedPinMatch     = D8,      // LED pin if set temperature reached
     eLedPinCool      = D9,      // LED pin for cooling
     eLedPinFrost     = D10,     // LED pin at risk of frost
-                        
+
     eLedPinError     = D10,     // blink LED pin in case of error
-                        
+
     eLedPinOnBoard   = D13,     // Arduino nano onboard LED
 };
 
@@ -244,12 +255,19 @@ enum {
 enum {
     eLedOff     = 0,        // OFF usually not used
 
-    eLedHeat    = 1 << 0,   // water needs to be heated
-    eLedMatch   = 1 << 1,   // water temperature matches set temperatur
-    eLedCool    = 1 << 2,   // water needs to be cooled down
-    eLedFrost   = 1 << 3,   // ON in case temp of roof is less than or equal to eTempFrost since then there is any risk that water freezes!
-    eLedOnBoard = 1 << 4,   // on board LED blinks as alive signal
-    eOutPump    = 1 << 5,   // ON in case pump is running and heater valve has to be closed (= heating/cooling)
+    eLedHeatIndex    = 0,
+    eLedMatchIndex   = 1,
+    eLedCoolIndex    = 2,
+    eLedFrostIndex   = 3,
+    eLedOnBoardIndex = 4,
+    eOutPumpIndex    = 5,
+
+    eLedHeat    = 1 << eLedHeatIndex   ,   // water needs to be heated
+    eLedMatch   = 1 << eLedMatchIndex  ,   // water temperature matches set temperatur
+    eLedCool    = 1 << eLedCoolIndex   ,   // water needs to be cooled down
+    eLedFrost   = 1 << eLedFrostIndex  ,   // ON in case temp of roof is less than or equal to eTempFrost since then there is any risk that water freezes!
+    eLedOnBoard = 1 << eLedOnBoardIndex,   // on board LED blinks as alive signal
+    eOutPump    = 1 << eOutPumpIndex   ,   // ON in case pump is running and heater valve has to be closed (= heating/cooling)
 };
 //                   enum Bits:  eLedHeat     eLedMatch     eLedCool     eLedFrost     eLedOnBoard     eOutPump
 const uint8_t pins[]               = {eLedPinHeat, eLedPinMatch, eLedPinCool, eLedPinFrost, eLedPinOnBoard, eOutPinPump};          // order should be identical with previous enum!!!
@@ -277,13 +295,18 @@ uint8_t  sensorData[2][12];
 
 
 // variables for main-loop
-uint16_t tempSetArray[eTempSamples];     // samples of set temperature potentiometer
-uint16_t tempSetAdc;                     // set temp ADC value
-uint16_t tempSet;                        // resulting set temp value
+uint16_t tempSetArray[eTempSamples];    // samples of set temperature potentiometer
+uint16_t tempSetAdc;                    // set temp ADC value
+uint16_t tempSet;                       // resulting set temp value
 
-bool     pump       = false;             // current pump state
-uint8_t  portStates = 0;                 // current LEDs states
-
+enum {
+    eHeatStateCool  = -1,
+    eHeatStateMatch =  0,
+    eHeatStateHeat  =  1,
+};
+bool     pump       = false;            // current pump state
+uint8_t  portStates = 0;                // current LEDs states
+int8_t   heatCool   = eHeatStateMatch;  // current heat/cool state, 0 = match, 1 = heat, -1 = cool
 
 // one wire object
 OneWire ds1820(eOutPinOneWire);
@@ -317,13 +340,13 @@ static inline bool assert(bool successful, eError_mt error) {
     if (!successful) {
         Serial.print(F("Error: "));
         Serial.println(error);
-        
+
         // store error in case error buffer is not yet full
         if (errorBufferIndex < sizeof(errorBuffer)/sizeof(errorBuffer[0])) {
             errorBuffer[errorBufferIndex++] = error;
         }
     }
-    
+
     return successful;
 }
 
@@ -531,7 +554,7 @@ uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
     ds1820.reset();
     ds1820.select(sensorAddress);                   // select sensor
     ds1820.write(eStartOneWireScratchPadRead);      // read scratch pad
-    
+
     for (uint8_t loop = 0; loop < eDs18B20LengthTemperature; loop++) {
         data[loop] = ds1820.read();
     }
@@ -540,7 +563,7 @@ uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
     assert(OneWire::crc8(data, eDs18B20LengthTemperature - 1) == data[eDs18B20LengthTemperature - 1], eError_000B);
 
     assert(!memncmpx(data, eDs18B20LengthTemperature, 0x00), eError_000D);
-    
+
     // we don't need negative values so clear them to 0°C for simplier calculation
     if (rawTemp & 0x8000) {
         rawTemp = 0;
@@ -562,11 +585,11 @@ uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
  */
 bool memncmpx(uint8_t * data, uint8_t length, uint8_t value) {
     bool equal = true;
-    
+
     for (uint8_t index = 0; (index < length) && equal; index++) {
         equal &= (data[index] == value);
     }
-    
+
     return equal;
 }
 
@@ -608,6 +631,8 @@ void printInformation(void) {
     printSensorTemp(tempSet);
     Serial.print(F("°C / Pump: "));
     Serial.print(pump ? F("ON") : F("OFF"));
+    Serial.print(F(" / heatCool: "));
+    Serial.print(heatCool == eHeatStateMatch ? F("MATCH") : heatCool == eHeatStateHeat ? F("HEAT") : F("COOL"));
     Serial.print(F(" / LEDs: 0b0"));
     Serial.print(portStates, BIN);
     Serial.print(F(" [ "));
@@ -665,12 +690,12 @@ void setup() {
     // initialize debug inputs
     pinMode(eInPinDebugWater, INPUT_PULLUP);
     pinMode(eInPinDebugRoof,  INPUT_PULLUP);
-                              
-    // initialize outputs     
+
+    // initialize outputs
     pinMode(eOutPinPump,      OUTPUT);
     pinMode(eLedPinHeat,      OUTPUT);
-                              
-    // initialize LEDs ports  
+
+    // initialize LEDs ports
     pinMode(eLedPinMatch,     OUTPUT);
     pinMode(eLedPinCool,      OUTPUT);
     pinMode(eLedPinFrost,     OUTPUT);
@@ -707,7 +732,7 @@ void setup() {
 
     assert(sensorFound[eSensorIndexRoof],  eError_0009);
     assert(sensorFound[eSensorIndexWater], eError_000A);
-    
+
     if (!isError()) {
         for (uint8_t index = 0; index < eSensorIndexMax; index++) {
             sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
@@ -729,16 +754,18 @@ void loop() {
         for (uint8_t index = 0; index < sizeof(pins); index++) {
             digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
         }
-        
+
         while(1) {      // endless loop in error case
             for (uint8_t blinkenLights = 0; blinkenLights < errorBuffer[0]; blinkenLights++) {
-                digitalWrite(eLedPinError, LOW);
+                digitalWrite(eLedPinError,   pinsActive[eLedFrostIndex]);       // for user
+                digitalWrite(eLedPinOnBoard, pinsActive[eLedOnBoardIndex]);     // for debugging
                 delay(500);
-                digitalWrite(eLedPinError, HIGH);
+                digitalWrite(eLedPinError,   !pinsActive[eLedFrostIndex]);      // for user
+                digitalWrite(eLedPinOnBoard, !pinsActive[eLedOnBoardIndex]);    // for debugging
                 delay(500);
             }
             delay(2000);
-    
+
             printErrorBuffer();
             printInformation();
         }
@@ -754,14 +781,14 @@ void loop() {
             case eStateMedian:      // sort phase for measured set temperatures
                 tempSetAdc = simpleSort(tempSetArray, sizeof(tempSetArray) / sizeof(tempSetArray[0]));
                 break;
-    
+
             case eStateConversion:  // convert set temperature
                 tempSet = tempConversion(tempSetAdc, potiTempValues) * 100;
                 break;
-    
+
             case eStateOneWire:     // get 1-wire temperatures
                 static uint8_t sensorIndex = 0;
-                
+
                 // get temperature from one sensor (otherwise state machine cycle will take too long!)
                 sensorTemp[sensorIndex] = getSensorTemperature(sensorAddresses[sensorIndex], sensorData[sensorIndex]);
 
@@ -776,7 +803,7 @@ void loop() {
                         sensorTemp[eSensorIndexRoof] += 500;
                     }
                 }
-    
+
                 // select next sensor index
                 sensorIndex++;
                 if (sensorIndex >= eSensorIndexMax) {
@@ -786,13 +813,24 @@ void loop() {
 
             case eStateAction:
             {
+                /* initially we start with "MATCH" per default
+                 *  - if water is colder than set temp - 1.0°C then "HEAT" is selected
+                 *  - if "HEAT" was already selected it stays selected as long as water is colder than set temp + 0.5°C so it won't toggle between heating and cooling
+                 *  - if "HEAT" was already selected and water reaches set temp + 0.5°C then "MATCH" will be selected
+                 *  - if water is warmer than set temp + 1.0°C then "COOL" is selected
+                 *  - if "COOL" was already selected it stays selected as long as water is warmer than set temp - 0.5°C so it won't toggle between heating and cooling
+                 *  - if "COOL" was already selected and water reaches set temp - 0.5°C then "MATCH" will be selected
+                 *  - if "MATCH" is selected it will stay selected as long as water is within [set temp - 1.0°C, set temp + 1.0°C ]
+                 */
+
                 static bool toggleLed = false;
-    
+
                 portStates = 0;           // re-init ports
-    
+
                 // action phases
-                if (sensorTemp[eSensorIndexWater] < tempSet) {
+                if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] < tempSet - 2 * eTempMatchHysteresis)) || ((heatCool == eHeatStateHeat) && (sensorTemp[eSensorIndexWater] < tempSet + eTempMatchHysteresis))) {
                     // water too cold
+                    heatCool = eHeatStateHeat;
 
                     /* To get some hysteresis pump will be ON when:
                      *  - if pump is OFF while roof temp > water temp + hysteresis
@@ -809,8 +847,9 @@ void loop() {
                         portStates |= eLedMatch;
                     }
                 }
-                else if (sensorTemp[eSensorIndexWater] > tempSet) {
+                else if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] > tempSet + 2 * eTempMatchHysteresis)) || ((heatCool == eHeatStateCool) && (sensorTemp[eSensorIndexWater] > tempSet - eTempMatchHysteresis))) {
                     // water too warm
+                    heatCool = eHeatStateCool;
 
                     /* To get some hysteresis pump will be ON when:
                      *  - if pump is OFF while roof temp < water temp - hysteresis
@@ -828,27 +867,29 @@ void loop() {
                 }
                 else {
                     // water matches
+                    heatCool = eHeatStateMatch;
+
                     pump = false;
                     portStates |= eLedMatch;
                 }
-    
+
                 // danger of frost?
                 if (sensorTemp[eSensorIndexRoof] < eTempFrost) {
                     portStates |= eLedFrost;
                 }
-    
+
                 // toggle LED currently ON?
-                if (toggleLed) {
+                if (toggleLed && !isError()) {
                     portStates |= eLedOnBoard;
                 }
                 toggleLed = !toggleLed;
-    
+
                 // pump ON?
                 if (pump) {
                     portStates |= eOutPump;
                 }
-   
-    
+
+
                 // set/clear output ports dependent on set bits in ports mask
                 for (uint8_t index = 0; index < sizeof(pins); index++) {
                     if (portStates & (1 << index)) {
@@ -880,7 +921,7 @@ void loop() {
 
             default:
                 assert(false, eError_0002);
-    
+
                 state = -1;   // set state machine back to first state
                 break;
         }
