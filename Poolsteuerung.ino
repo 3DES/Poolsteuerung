@@ -17,9 +17,9 @@
  *
  *
  *      voltage divider                potentiometer                                 LEDs                                          pump + heater valve                                  1-wire sensors
- *        roof/water                     temp set
+ *        roof/water                     temp set                                                                                                                                       used cable is a 3x1,5 JFLEX ([1], [2] and [GG] are the single wires!)
  *
- *            5V                            5V                                    1k5                                                 VCC         ~24V         L(230V)                    VCC
+ *            5V                            5V                                    1k5                                                 VCC         ~24V         L(230V)                    VCC [1]
  *            +                              +                                    ___    LED                                           +            +             +                        +
  *            |                              |                            VCC +--|___|---|>|-----+ uC                                  |            |             |                        |
  *            |                              |                                            \\                                     .-----o            |             |                        o-----.
@@ -29,12 +29,12 @@
  *           '-'                            '-'                                                                                  |     |          /             /                         | |    |    ______
  *            |                              |                                                                                   '-----o        o/  o         o/  o                       '-'    '---|3 VDD |
  *   uC +-----o---------.                    |                                                                      10k                |        |   |         |   |                        |         |      |
- *            |         |                   .-.                                                                     ___              |/    open |   | close       |                  uC +--o---------|2 DQ  |
+ *            |         |                   .-.                                                                     ___              |/    open |   | close       |             uC [GG] +--o---------|2 DQ  |
  *           .-.        |               10k | |<--o----o----+ uC                                            uC +---|___|----o-----o--|          |   |             |                                  |      |
  *           | | 5k    --- 10n              | |   |    |                                                                    |     |  |>         |   |             |                     .------------|1_GND_|
  *           | | NTC   ---                  '-'   |    |                                                                    o    .-.   |         \ /              |                     |
  *           '-'        |                    |    |    |                                                                   /     | |2k |         .-.              |                    ===
- *            |         |                    o----'    |                                                      manual |-^--/      | |   |        /   \             |                    GND
+ *            |         |                    o----'    |                                                      manual |-^--/      | |   |        /   \             |                    GND [2]
  *            o---------'                    |        ---  10n                                                           /  o    '-'   |       |  M  |            |
  *            |                             .-.       ---                                                                   |     |    |        \   /             |
  *            |                         460 | |<--.    |                                                                    '-----o----'         '-'              |
@@ -45,9 +45,9 @@
  *                                           |         |
  *                                           o---------'
  *                                           |
- *                                          .-.   
- *                                      1k2 | |   
- *                                          | |   
+ *                                          .-.
+ *                                      1k2 | |
+ *                                          | |
  *                                          '-'
  *                                           |
  *                                          ===
@@ -139,9 +139,9 @@
 #define D1   1              // TX
 #define D2   2              // one wire bus
 #define D3   3              // pump ON + heater valve closed (closed means water is pumped to the roof)
-#define D4   4              // switchable measurement power supply
-#define D5   5              // 
-#define D6   6              // 
+#define D4   4              // 
+#define D5   5              // set to low increases water temp by 5°C (for debugging)
+#define D6   6              // set to low increases roof  temp by 5°C (for debugging)
 #define D7   7              // LED red   "heizen"
 #define D8   8              // LED red   "Solltemperatur erreicht"
 #define D9   9              // LED green "kühlen"
@@ -167,29 +167,32 @@
 #define A7  7               //
 
 
-uint16_t lastError = 0;    // to store any error for blinken lights if any happened
+uint16_t errorBuffer[10];           // to store any error for blinken lights if any happened
+uint16_t errorBufferIndex = 0;      // index where next error can be stored
 
 
-// DS18B20 variables
-bool     ds18B20Found = false;  // DS18B20 sensor found during startup?
-uint8_t  ds18B20Address[8];     // address of found DS18B20 sensor
-uint8_t  ds18B20Data[12];       // to collect received data
-uint16_t ds18B20Value;          // lastly measured value (in °C*100, so there are two decimals contained)
+/**
+ * Data from DS18B20 have different length, we have to now that length to calculate proper CRCs
+ */
+enum {
+    eDs18B20LengthAddress     = 8,
+    eDs18B20LengthTemperature = 9,
+};
 
 
 /**
  * some constant values
  */
 enum {
-  eTempHysteresis   = 3,    // don't change pump settings within +/- hysteresis range °C
-  eTempFrost        = 5,    // show frost when this temp or less has been reached
-
-  eTempSamples      = 6,    // amount of temp samples (must be 2^n+2 because of sort and median algorithm!)
-  eStateMedian      = eTempSamples,
-  eStateConversion,
-  eStateAction,
-  eStateOneWire,
-  eStatePrint,
+    eTempHysteresis    = 300,  // don't start pump until temp > temp +/- hysteresis has been reached (unit: 1/100°C)
+    eTempFrost         = 5,    // show frost when this temp or less has been reached
+                       
+    eTempSamples       = 6,    // amount of temp samples (must be 2^n+2 because of sort and median algorithm!)
+    eStateMedian       = eTempSamples,
+    eStateConversion,
+    eStateOneWire,
+    eStateAction,
+    eStatePrint,
 };
 
 
@@ -197,13 +200,20 @@ enum {
  * uniq error values
  */
 typedef enum {
-  eError_none = 0,
-  eError_0001 = 0x0001,     // array length not as expected
-  eError_0002 = 0x0002,     // unexpected state reached
-  eError_0003 = 0x0003,     // given ADC value is smaller than given lowTempDegree  and sensor is NTC
-  eError_0004 = 0x0004,     // given ADC value is larger  than given highTempDegree and sensor is NTC
-  eError_0005 = 0x0005,     // given ADC value is larger  than given lowTempDegree  and sensor is PTC
-  eError_0006 = 0x0006,     // given ADC value is smaller than given highTempDegree and sensor is PTC
+    eError_none = 0,
+    eError_0001 = 0x0001,     // array length not as expected
+    eError_0002 = 0x0002,     // unexpected state reached
+    eError_0003 = 0x0003,     // given ADC value is smaller than given lowTempDegree  and sensor is NTC
+    eError_0004 = 0x0004,     // given ADC value is larger  than given highTempDegree and sensor is NTC
+    eError_0005 = 0x0005,     // given ADC value is larger  than given lowTempDegree  and sensor is PTC
+    eError_0006 = 0x0006,     // given ADC value is smaller than given highTempDegree and sensor is PTC
+    eError_0007 = 0x0007,     // initial ds18b20 scan received message with CRC error
+    eError_0008 = 0x0008,     // unknown ds18b20 found
+    eError_0009 = 0x0009,     // roof sensor not found
+    eError_000A = 0x000A,     // water sensor not found
+    eError_000B = 0x000B,     // CRC error while reading temperature from sensor
+    eError_000C = 0x000C,     // sensor data in initialization phase was completely zero (DS18B20 CRC is worthless if e.g. pull-up fails, then all data is 0x00 and CRC is also 0x00)
+    eError_000D = 0x000D,     // sensor data while reading temperature from sensor was completely zero (DS18B20 CRC is worthless if e.g. pull-up fails, then all data is 0x00 and CRC is also 0x00)
 } eError_mt;
 
 
@@ -211,70 +221,72 @@ typedef enum {
  * IOs used for ADC and digital IOs
  */
 enum {
-  eTempPinRoof    = A0,     // pin for roof temp sensor
-  eTempPinWater   = A1,     // pin for water temp sensor
-  eTempPinSet     = A2,     // pin for set temp
-                            
-  eOutPinOneWire  = D2,     // one wire pin (to setup temperature values)
-  eOutPinPump     = D3,     // pin for pump relais
-  eOutPinMeassure = D4,     // pin to supply NTCs during measurement (if they are supplied all the time they get warm by themselves!)
-                            
-  eLedPinHeat     = D7,     // LED pin for heating
-  eLedPinMatch    = D8,     // LED pin if set temperature reached
-  eLedPinCool     = D9,     // LED pin for cooling
-  eLedPinFrost    = D10,    // LED pin at risk of frost
-                  
-  eLedPinOnBoard  = D13,    // Arduino nano onboard LED
+    eTempPinSet      = A0,      // pin for set temp
+                        
+    eOutPinOneWire   = D2,      // one wire pin (to setup temperature values)
+    eOutPinPump      = D3,      // pin for pump relais
+
+    eInPinDebugWater = D4,      
+    eInPinDebugRoof  = D5,
+
+    eLedPinHeat      = D7,      // LED pin for heating
+    eLedPinMatch     = D8,      // LED pin if set temperature reached
+    eLedPinCool      = D9,      // LED pin for cooling
+    eLedPinFrost     = D10,     // LED pin at risk of frost
+                        
+    eLedPinError     = D10,     // blink LED pin in case of error
+                        
+    eLedPinOnBoard   = D13,     // Arduino nano onboard LED
 };
 
 
 // latch to pin matrix
 enum {
-  eLedOff     = 0x00,        // OFF usually not used
+    eLedOff     = 0,        // OFF usually not used
 
-  eLedHeat    = 0x01 << 0,   // water needs to be heated
-  eLedMatch   = 0x01 << 1,   // water temperature matches set temperatur
-  eLedCool    = 0x01 << 2,   // water needs to be cooled down
-  eLedFrost   = 0x01 << 3,   // ON in case temp of roof is less than or equal to eTempFrost since then there is any risk that water freezes!
-  eLedOnBoard = 0x01 << 4,   // on board LED blinks as alive signal
-  eOutPump    = 0x01 << 5,   // ON in case pump is running and heater valve has to be closed (= heating/cooling)
+    eLedHeat    = 1 << 0,   // water needs to be heated
+    eLedMatch   = 1 << 1,   // water temperature matches set temperatur
+    eLedCool    = 1 << 2,   // water needs to be cooled down
+    eLedFrost   = 1 << 3,   // ON in case temp of roof is less than or equal to eTempFrost since then there is any risk that water freezes!
+    eLedOnBoard = 1 << 4,   // on board LED blinks as alive signal
+    eOutPump    = 1 << 5,   // ON in case pump is running and heater valve has to be closed (= heating/cooling)
 };
-//                enum Bits:  eLedHeat     eLedMatch     eLedCool     eLedFrost     eLedOnBoard     eOutPump
-const uint8_t pins[]       = {eLedPinHeat, eLedPinMatch, eLedPinCool, eLedPinFrost, eLedPinOnBoard, eOutPinPump};          // order should be identical with previous enum!!!
-const uint8_t pinsActive[] = {LOW,         LOW,          LOW,         LOW,          HIGH,           HIGH};                 // value to set refering output to ON
+//                   enum Bits:  eLedHeat     eLedMatch     eLedCool     eLedFrost     eLedOnBoard     eOutPump
+const uint8_t pins[]               = {eLedPinHeat, eLedPinMatch, eLedPinCool, eLedPinFrost, eLedPinOnBoard, eOutPinPump};          // order should be identical with previous enum!!!
+const uint8_t pinsActive[]         = {LOW,         LOW,          LOW,         LOW,          HIGH,           HIGH};                 // value to set refering output to ON
+const char    pinsOnNames[][6][10] = {{"heat",     "match",      "cool",      "frost",      "onboard",      "pump"},
+                                      {"HEAT",     "MATCH",      "COOL",      "FROST",      "ONBOARD",      "PUMP"}};
+
+
+// indices for following sensorAddresses array
+enum {
+    eSensorIndexRoof  = 0,
+    eSensorIndexWater = 1,
+    eSensorIndexMax
+};
+
+
+// expected 1-wire sensors
+const uint8_t sensorAddresses[2][8] = {
+    { 0x28, 0xB2, 0xB7, 0x26, 0x00, 0x00, 0x80, 0x9C },         // roof  sensor
+    { 0x28, 0xFF, 0x21, 0x4F, 0x54, 0x14, 0x00, 0x35 }          // water sensor
+};
+bool     sensorFound[2] = { false, false };
+uint16_t sensorTemp[2];
+uint8_t  sensorData[2][12];
+
+
+// variables for main-loop
+uint16_t tempSetArray[eTempSamples];     // samples of set temperature potentiometer
+uint16_t tempSetAdc;                     // set temp ADC value
+uint16_t tempSet;                        // resulting set temp value
+
+bool     pump       = false;             // current pump state
+uint8_t  portStates = 0;                 // current LEDs states
 
 
 // one wire object
 OneWire ds1820(eOutPinOneWire);
-
-
-#define MEDIAN(low,high)     ((low) + (((high) - (low)) / 2))
-
-
-/**
- * "default" ADC values for different temperatures
- *                                  10°C            15°C                                    20°C   25°C   30°C  x35°C   40°C  x45°C   50°C    zero_terminated
- */
-enum {
-  // resistor values for 5k NTC
-  e5kNtc10Degree = 9952U,
-  e5kNtc20Degree = 6246U,
-  e5kNtc25Degree = 5000U,
-  e5kNtc30Degree = 4028U,
-  e5kNtc40Degree = 2662U,
-  e5kNtc50Degree = 1800U,
-
-  e5kNtc15Degree = MEDIAN(e5kNtc10Degree, e5kNtc20Degree),
-  e5kNtc35Degree = MEDIAN(e5kNtc30Degree, e5kNtc40Degree),
-  e5kNtc45Degree = MEDIAN(e5kNtc40Degree, e5kNtc50Degree),
-};
-const uint16_t resistor5kNtcValues[]  = { e5kNtc10Degree, e5kNtc15Degree, e5kNtc20Degree, e5kNtc25Degree, e5kNtc30Degree, e5kNtc35Degree, e5kNtc40Degree, e5kNtc45Degree, e5kNtc50Degree, 0 };
-
-#define ROOF_TEMP_CORRECTOR(x)   (x * 10 / 100)      // valid for 5k NTC placed on roof                 // @todo Faktor stimmt noch garnicht, muß erst ermittelt werden!!!
-const uint16_t adcRoofTempValues[]    = { ROOF_TEMP_CORRECTOR(e5kNtc10Degree), ROOF_TEMP_CORRECTOR(e5kNtc15Degree), ROOF_TEMP_CORRECTOR(e5kNtc20Degree), ROOF_TEMP_CORRECTOR(e5kNtc25Degree), ROOF_TEMP_CORRECTOR(e5kNtc30Degree), ROOF_TEMP_CORRECTOR(e5kNtc35Degree), ROOF_TEMP_CORRECTOR(e5kNtc40Degree), ROOF_TEMP_CORRECTOR(e5kNtc45Degree), ROOF_TEMP_CORRECTOR(e5kNtc50Degree), 0 };
-
-#define WATER_TEMP_CORRECTOR(x)  (x * 11 / 100)      // valid for 5k NTC placed into water              // @todo Faktor stimmt noch garnicht, muß erst ermittelt werden!!!
-const uint16_t adcWaterTempValues[]   = { ROOF_TEMP_CORRECTOR(e5kNtc10Degree), ROOF_TEMP_CORRECTOR(e5kNtc15Degree), ROOF_TEMP_CORRECTOR(e5kNtc20Degree), ROOF_TEMP_CORRECTOR(e5kNtc25Degree), ROOF_TEMP_CORRECTOR(e5kNtc30Degree), ROOF_TEMP_CORRECTOR(e5kNtc35Degree), ROOF_TEMP_CORRECTOR(e5kNtc40Degree), ROOF_TEMP_CORRECTOR(e5kNtc45Degree), ROOF_TEMP_CORRECTOR(e5kNtc50Degree), 0 };
 
 
 /**
@@ -286,17 +298,33 @@ const uint16_t potiTempValues[] = {   223,   295,   367,   443,   512,   599,   
 
 
 /**
+ * Returns current error state
+ *
+ * @return      TRUE in case error already happened, FALSE otherwise
+ */
+static inline bool isError(void) {
+    return (errorBufferIndex != 0);
+}
+
+
+/**
  * assert function to check something and set error if necessary
  *
  * @successful      true in case test was OK, false if test failed
  * @error           uniq error number to be stored
  */
-static inline void assert(bool successful, eError_mt error) {
-  if (!successful) {
-    Serial.print(F("Error: "));
-    Serial.println(error);
-    lastError = error;
-  }
+static inline bool assert(bool successful, eError_mt error) {
+    if (!successful) {
+        Serial.print(F("Error: "));
+        Serial.println(error);
+        
+        // store error in case error buffer is not yet full
+        if (errorBufferIndex < sizeof(errorBuffer)/sizeof(errorBuffer[0])) {
+            errorBuffer[errorBufferIndex++] = error;
+        }
+    }
+    
+    return successful;
 }
 
 
@@ -312,35 +340,35 @@ static inline void assert(bool successful, eError_mt error) {
  * @result      calculated median ignoring largest and smallest element
  */
 uint16_t simpleSort(uint16_t ptr[], uint8_t length) {
-  assert(length == 6, eError_0001);   // ensure proper array length
+    assert(length == 6, eError_0001);   // ensure proper array length
 
-  uint16_t temp;
+    uint16_t temp;
 
-  // search for smallest and largest element and put them into the last two array positions
-  for (uint8_t loop = 0; loop < length - 2; loop++) {
-    // current element smaller than current minimum?
-    if (ptr[loop] < ptr[length - 2]) {
-      temp = ptr[length - 2];
-      ptr[length - 2] = ptr[loop];
-      ptr[loop] = temp;
+    // search for smallest and largest element and put them into the last two array positions
+    for (uint8_t loop = 0; loop < length - 2; loop++) {
+        // current element smaller than current minimum?
+        if (ptr[loop] < ptr[length - 2]) {
+            temp = ptr[length - 2];
+            ptr[length - 2] = ptr[loop];
+            ptr[loop] = temp;
+        }
+
+        // current element larger than current maximum?
+        if (ptr[loop] > ptr[length - 1]) {
+            temp = ptr[length - 1];
+            ptr[length - 1] = ptr[loop];
+            ptr[loop] = temp;
+        }
     }
 
-    // current element larger than current maximum?
-    if (ptr[loop] > ptr[length - 1]) {
-      temp = ptr[length - 1];
-      ptr[length - 1] = ptr[loop];
-      ptr[loop] = temp;
+    // calculate median of the first 4 elements and ignore smallest and largest one (for EMV reasons)
+    temp = 0;
+    for (uint8_t loop = 0; loop < length - 2; loop++) {
+        temp += ptr[loop];
     }
-  }
+    temp >>= 2;   // 4 elements added so divide them by 4 to get the median value
 
-  // calculate median of the first 4 elements and ignore smallest and largest one (for EMV reasons)
-  temp = 0;
-  for (uint8_t loop = 0; loop < length - 2; loop++) {
-    temp += ptr[loop];
-  }
-  temp >>= 2;   // 4 elements added so divide them by 4 to get the median value
-
-  return temp;
+    return temp;
 }
 
 
@@ -357,53 +385,52 @@ uint16_t simpleSort(uint16_t ptr[], uint8_t length) {
  * @return              degree calculated from the given information
  */
 uint8_t tempCalculation(uint16_t adcValue, uint16_t lowTempDegree, uint16_t highTempDegree, uint16_t lowTempAdc, uint16_t highTempAdc) {
-  uint8_t result;
-  uint16_t degreeDelta = highTempDegree - lowTempDegree;
+    uint8_t result;
+    uint16_t degreeDelta = highTempDegree - lowTempDegree;
 
-  Serial.print(F("Calculate: degreeDelta: "));
-  Serial.print(degreeDelta, DEC);
+    Serial.print(F("Calculate: degreeDelta: "));
+    Serial.print(degreeDelta, DEC);
 
-  if (adcValue == lowTempAdc) {
-    result = lowTempDegree;           // match with low temp ADC value found
-  }
-  else
-  if (adcValue == highTempAdc) {
-    result = highTempDegree;          // match with high temp ADC value found
-  }
-  else {
-    uint16_t adcDelta;
-
-    // PTC or NTC
-    if (highTempAdc > lowTempAdc) {
-      assert(adcValue >= lowTempAdc,  eError_0003);     // ensure given ADC value is in correct range
-      assert(adcValue <= highTempAdc, eError_0004);     // ensure given ADC value is in correct range
-
-      // PTC support
-      adcDelta = highTempAdc - lowTempAdc;
-      adcValue -= lowTempAdc;     // normalize ADC value [0..highTempAdc]
+    if (adcValue == lowTempAdc) {
+        result = lowTempDegree;           // match with low temp ADC value found
+    }
+    else if (adcValue == highTempAdc) {
+        result = highTempDegree;          // match with high temp ADC value found
     }
     else {
-      assert(adcValue <= lowTempAdc,  eError_0005);     // ensure given ADC value is in correct range
-      assert(adcValue >= highTempAdc, eError_0006);     // ensure given ADC value is in correct range
+        uint16_t adcDelta;
 
-      // NTC support
-      adcDelta = lowTempAdc - highTempAdc;
-      adcValue -= highTempAdc;    // normalize ADC value [0..highTempAdc]
+        // PTC or NTC
+        if (highTempAdc > lowTempAdc) {
+            assert(adcValue >= lowTempAdc,  eError_0003);     // ensure given ADC value is in correct range
+            assert(adcValue <= highTempAdc, eError_0004);     // ensure given ADC value is in correct range
+
+            // PTC support
+            adcDelta = highTempAdc - lowTempAdc;
+            adcValue -= lowTempAdc;     // normalize ADC value [0..highTempAdc]
+        }
+        else {
+            assert(adcValue <= lowTempAdc,  eError_0005);     // ensure given ADC value is in correct range
+            assert(adcValue >= highTempAdc, eError_0006);     // ensure given ADC value is in correct range
+
+            // NTC support
+            adcDelta = lowTempAdc - highTempAdc;
+            adcValue -= highTempAdc;    // normalize ADC value [0..highTempAdc]
+        }
+
+        result = lowTempDegree + (uint8_t)((((uint32_t)degreeDelta) * adcValue) / adcDelta);      // uint32_t is necessary to prevent overflows... '*' before '/' is necessary to reduce rounding errors
+
+        Serial.print(F(" / adcValue: "));
+        Serial.print(adcValue, HEX);
+        Serial.print(F(" / adcDelta: "));
+        Serial.print(adcDelta, HEX);
     }
 
-    result = lowTempDegree + (uint8_t)((((uint32_t)degreeDelta) * adcValue) / adcDelta);      // uint32_t is necessary to prevent overflows... '*' before '/' is necessary to reduce rounding errors
+    Serial.print(F(" / result degree: "));
+    Serial.print(result, DEC);
+    Serial.print(F("\n"));
 
-    Serial.print(F(" / adcValue: "));
-    Serial.print(adcValue, HEX);
-    Serial.print(F(" / adcDelta: "));
-    Serial.print(adcDelta, HEX);
-  }
-
-  Serial.print(F(" / result degree: "));
-  Serial.print(result, DEC);
-  Serial.print(F("\n"));
-
-  return result;
+    return result;
 }
 
 /**
@@ -415,364 +442,448 @@ uint8_t tempCalculation(uint16_t adcValue, uint16_t lowTempDegree, uint16_t high
  * @return     temperature equivalent in °C
  */
 uint8_t tempConversion(uint16_t adcValue, const uint16_t * const tempArray) {
-  uint8_t  lowIndex  = 0;       // index of ADC value smaller than adcValue content
-  uint8_t  highIndex = 0;       // index of ADC value larger  than adcValue content
+    uint8_t  lowIndex  = 0;       // index of ADC value smaller than adcValue content
+    uint8_t  highIndex = 0;       // index of ADC value larger  than adcValue content
 
-  uint16_t value     = tempArray[0];            // read first temp array entry
-  uint16_t nextValue = tempArray[1];            // need to read second value from array to decide type of temp sensor (NTC or PTC)
-  bool     PTC       = (value > nextValue);     // if first value is larger than second one it must be a PTC, otherwise it's an NTC
+    uint16_t value     = tempArray[0];            // read first temp array entry
+    uint16_t nextValue = tempArray[1];            // need to read second value from array to decide type of temp sensor (NTC or PTC)
+    bool     PTC       = (value > nextValue);     // if first value is larger than second one it must be a PTC, otherwise it's an NTC
 
-  Serial.print(F("Convert: "));
-  Serial.print(PTC ? F("PTC") : F("NTC"));
-  Serial.print(F(" / adc: "));
-  Serial.print(adcValue, HEX);
+    Serial.print(F("Convert: "));
+    Serial.print(PTC ? F("PTC") : F("NTC"));
+    Serial.print(F(" / adc: "));
+    Serial.print(adcValue, HEX);
 
-  // find temperature range
-  if (adcValue <= value) {
-    // if temperature is less than lowest value in array take lowest value (deeper temperatures are not from interest!)
-    adcValue = value;
+    // find temperature range
+    if (adcValue <= value) {
+        // if temperature is less than lowest value in array take lowest value (deeper temperatures are not from interest!)
+        adcValue = value;
 
-    // low- and highIndex stay unchanged!
-    // lowIndex  = 0;
-    // highIndex = 0;
-  }
-  else {
-    nextValue = value;      // needs to be reset, otherwise following loop would stop too early!
-
-    //     [-------------PTC---------------]    [-------------NTC--------------]     [-end of array-]
-    while (((PTC  && (adcValue < nextValue)) || (!PTC && (adcValue > nextValue))) && (nextValue != 0)) {
-      highIndex++;
-      value = nextValue;
-      nextValue = tempArray[highIndex];
-    }
-
-    // end of array reached?
-    if (nextValue == 0) {
-      // if end of temperature array reached measured ADC is too large and must be set to last array value
-      adcValue = value;
-
-      // set indices back to last valid table entry
-      highIndex--;
-      lowIndex = highIndex;
+        // low- and highIndex stay unchanged!
+        // lowIndex  = 0;
+        // highIndex = 0;
     }
     else {
-      // highIndex points to next larger/smaller element, so lowIndex must point to predecessor
-      lowIndex = highIndex - 1;
+        nextValue = value;      // needs to be reset, otherwise following loop would stop too early!
+
+        //     [-------------PTC---------------]    [-------------NTC--------------]     [-end of array-]
+        while (((PTC  && (adcValue < nextValue)) || (!PTC && (adcValue > nextValue))) && (nextValue != 0)) {
+            highIndex++;
+            value = nextValue;
+            nextValue = tempArray[highIndex];
+        }
+
+        // end of array reached?
+        if (nextValue == 0) {
+            // if end of temperature array reached measured ADC is too large and must be set to last array value
+            adcValue = value;
+
+            // set indices back to last valid table entry
+            highIndex--;
+            lowIndex = highIndex;
+        }
+        else {
+            // highIndex points to next larger/smaller element, so lowIndex must point to predecessor
+            lowIndex = highIndex - 1;
+        }
     }
-  }
 
-  Serial.print(F(" / adc new: "));
-  Serial.print(adcValue, HEX);
-  Serial.print(F(" / lowIndex: "));
-  Serial.print(lowIndex, DEC);
-  Serial.print(F(" / highIndex: "));
-  Serial.print(highIndex, DEC);
-  Serial.print(F(" / lowValue: "));
-  Serial.print(value, HEX);
-  Serial.print(F(" / nextValue: "));
-  Serial.print(nextValue, HEX);
-  Serial.print(F("\n"));
+    Serial.print(F(" / adc new: "));
+    Serial.print(adcValue, HEX);
+    Serial.print(F(" / lowIndex: "));
+    Serial.print(lowIndex, DEC);
+    Serial.print(F(" / highIndex: "));
+    Serial.print(highIndex, DEC);
+    Serial.print(F(" / lowValue: "));
+    Serial.print(value, HEX);
+    Serial.print(F(" / nextValue: "));
+    Serial.print(nextValue, HEX);
+    Serial.print(F("\n"));
 
-  return tempCalculation(adcValue, 10 + (5 * lowIndex), 10 + (5 * highIndex), value, nextValue);
+    return tempCalculation(adcValue, 10 + (5 * lowIndex), 10 + (5 * highIndex), value, nextValue);
 }
+
+
+/**
+ * Reads temperature from DS18B20 sensor, stores data in given data array (e.g. for print) and returns received temperature
+ * In case of error an error will be stored.
+ *
+ * @sensorAddress   address of DS18B20 to be read
+ * @data            to store raw received sensor data
+ *
+ * @return          temperature in 1/100°C
+ */
+uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
+    enum {
+        eStartOneWireMeasurement    = 0x44,
+        eStartOneWireScratchPadRead = 0xBE,
+    };
+
+    uint16_t result;
+
+    // initiate measurement
+    ds1820.reset();
+    ds1820.select(sensorAddress);                   // select sensor
+    ds1820.write(eStartOneWireMeasurement, 0);      // initiate measurement
+    delay(1000);                                    // wait 1 second (>= 750ms!)
+
+    // read temperature
+    ds1820.reset();
+    ds1820.select(sensorAddress);                   // select sensor
+    ds1820.write(eStartOneWireScratchPadRead);      // read scratch pad
+    
+    for (uint8_t loop = 0; loop < eDs18B20LengthTemperature; loop++) {
+        data[loop] = ds1820.read();
+    }
+    uint16_t rawTemp = (data[1] << 8) | data[0];
+
+    assert(OneWire::crc8(data, eDs18B20LengthTemperature - 1) == data[eDs18B20LengthTemperature - 1], eError_000B);
+
+    assert(!memncmpx(data, eDs18B20LengthTemperature, 0x00), eError_000D);
+    
+    // we don't need negative values so clear them to 0°C for simplier calculation
+    if (rawTemp & 0x8000) {
+        rawTemp = 0;
+    }
+
+    // we calculate temp from DS18B20 in 1/100°C so we don't need any floating point values!
+    result  = rawTemp / 16 * 100;                     // value from sensor = 16 * temp, so integer temp is value / 16, * 100 to get a fixed point value with two positions after decimal point
+    rawTemp = (rawTemp % 16) * 100 / 16;              // fract part of temp is rest of tem * 100 to get two decimal point positions and / 16 to get real value
+    result += rawTemp;                                // concat integer part and fraction part together to get a value that contains [1/100°C] value
+
+    return result;
+}
+
+
+/**
+ * Compares array with given value
+ *
+ * @return  TRUE in case all elements of array are identical with value, FALSE otherwise
+ */
+bool memncmpx(uint8_t * data, uint8_t length, uint8_t value) {
+    bool equal = true;
+    
+    for (uint8_t index = 0; (index < length) && equal; index++) {
+        equal &= (data[index] == value);
+    }
+    
+    return equal;
+}
+
+
+
+/**
+ * Since sensor temp contains temperature in 1/100°C degree it's necessary to print the first digits followed by a decimal point followed by the remaining two digits...
+ */
+void printSensorTemp(uint16_t sensorTemp) {
+    Serial.print(sensorTemp / 100, DEC);
+    Serial.print(".");
+    Serial.print(sensorTemp % 100, DEC);
+}
+
+
+/**
+ * prints DS18B20 address from given address array
+ */
+void printHexBytes(const uint8_t * data, uint8_t length) {
+    for (uint8_t index = 0; index < length; index++) {
+        if (data[index] <= 0xF) {
+            Serial.print("0");
+        }
+        Serial.print(data[index],HEX);
+        Serial.print(" ");
+    }
+}
+
+
+/**
+ * To print all collected information (usually last phase in state machine but also useful in error case)
+ */
+void printInformation(void) {
+    Serial.print(F("Roof: "));
+    printSensorTemp(sensorTemp[eSensorIndexRoof]);
+    Serial.print(F("°C / Water: "));
+    printSensorTemp(sensorTemp[eSensorIndexWater]);
+    Serial.print(F("°C / Set: "));
+    printSensorTemp(tempSet);
+    Serial.print(F("°C / Pump: "));
+    Serial.print(pump ? F("ON") : F("OFF"));
+    Serial.print(F(" / LEDs: 0b0"));
+    Serial.print(portStates, BIN);
+    Serial.print(F(" [ "));
+    for (uint8_t index = 0; index < sizeof(pins); index++) {
+        if (portStates & (1 << index)) {
+            Serial.print(pinsOnNames[1][index]);
+        }
+        else {
+            Serial.print(pinsOnNames[0][index]);
+        }
+        Serial.print(" ");
+    }
+    Serial.print(F("]\n"));
+
+    Serial.print(F("Set ADCs: "));
+    for (uint8_t loop = 0; loop < sizeof(tempSetArray) / sizeof(tempSetArray[0]); loop++) {
+        Serial.print(tempSetArray[loop], HEX);
+        Serial.print(F(" "));
+    }
+    Serial.print(F("\n"));
+
+    Serial.print(F("DS18B20 Roof Adr:  "));
+    printHexBytes(sensorAddresses[eSensorIndexRoof], eDs18B20LengthAddress);
+    Serial.print(F(" / Data: "));
+    printHexBytes(sensorData[eSensorIndexRoof], eDs18B20LengthTemperature);
+    Serial.println("");
+
+    Serial.print(F("DS18B20 Water Adr: "));
+    printHexBytes(sensorAddresses[eSensorIndexWater], eDs18B20LengthAddress);
+    Serial.print(F(" / Data: "));
+    printHexBytes(sensorData[eSensorIndexWater], eDs18B20LengthTemperature);
+    Serial.println("");
+
+    Serial.print(F("--------------------------------------------\n"));
+}
+
+
+void printErrorBuffer(void) {
+    for (uint8_t index = 0; index < errorBufferIndex; index++) {
+        Serial.print(F("Error: "));
+        Serial.print(errorBuffer[index], HEX);
+        Serial.println("");
+    }
+    Serial.println("");
+}
+
 
 /**
  * setup function
  */
 void setup() {
-  // put your setup code here, to run once:
-  Serial.begin(9600);           //  setup serial
+    // put your setup code here, to run once:
+    Serial.begin(9600);           //  setup serial
 
-  // initialize outputs
-  pinMode(eOutPinPump,     OUTPUT);
-  pinMode(eLedPinHeat,     OUTPUT);
-  pinMode(eOutPinMeassure, OUTPUT);  
+    // initialize debug inputs
+    pinMode(eInPinDebugWater, INPUT_PULLUP);
+    pinMode(eInPinDebugRoof,  INPUT_PULLUP);
+                              
+    // initialize outputs     
+    pinMode(eOutPinPump,      OUTPUT);
+    pinMode(eLedPinHeat,      OUTPUT);
+                              
+    // initialize LEDs ports  
+    pinMode(eLedPinMatch,     OUTPUT);
+    pinMode(eLedPinCool,      OUTPUT);
+    pinMode(eLedPinFrost,     OUTPUT);
+    pinMode(eLedPinOnBoard,   OUTPUT);
 
-  // initialize LEDs ports
-  pinMode(eLedPinMatch,    OUTPUT);
-  pinMode(eLedPinCool,     OUTPUT);
-  pinMode(eLedPinFrost,    OUTPUT);
-  pinMode(eLedPinOnBoard,  OUTPUT);
+    // search for a 1-wire sensors (first two supported all others will just be shown), 1st one is water temp, 2nd one is roof temp
+    uint8_t address[8];
+    ds1820.reset();
+    while (ds1820.search(address)) {
+        Serial.print(F("found DS18B20: "));
+        printHexBytes(address, eDs18B20LengthAddress);
 
-
-  // search for a 1-wire sensor (only one supporetd for temp sensor adjustment)
-  ds18B20Found = ds1820.search(ds18B20Address);
-  if (ds18B20Found) {
-    Serial.print(F("DS18B20 found: "));
-
-    // print found address
-    for (uint8_t index = 0; index < sizeof(ds18B20Address); index++) {
-      if (ds18B20Address[index] < 0x10) {
-        Serial.print(F("0"));
-      }
-      Serial.print(ds18B20Address[index], HEX);
-      Serial.print(F(" "));
+        if (!assert(OneWire::crc8(address, eDs18B20LengthAddress - 1) == address[eDs18B20LengthAddress - 1], eError_0007)) {
+            Serial.print(F(" : invalid CRC"));
+        }
+        else
+        if (!assert(!memncmpx(address, eDs18B20LengthAddress, 0x00), eError_000C)) {
+            Serial.print(F(" : zero data"));
+        }
+        else {
+            if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexRoof], sizeof(sensorAddresses[eSensorIndexRoof])) == 0) {
+                sensorFound[eSensorIndexRoof] = true;
+            }
+            else
+            if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexWater], sizeof(sensorAddresses[eSensorIndexWater])) == 0) {
+                sensorFound[eSensorIndexWater] = true;
+            }
+            else {
+                assert(false, eError_0008);
+            }
+        }
+        Serial.println("");
     }
-    Serial.print(F("\n"));
 
-    // check CRC of message
-    if (OneWire::crc8(ds18B20Address, 7) != ds18B20Address[7]) {
-      Serial.print(F("CRC invalid, ignore it!\n"));
-      ds18B20Found = false;
+    assert(sensorFound[eSensorIndexRoof],  eError_0009);
+    assert(sensorFound[eSensorIndexWater], eError_000A);
+    
+    if (!isError()) {
+        for (uint8_t index = 0; index < eSensorIndexMax; index++) {
+            sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
+            sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
+        }
     }
-
-    // ensure sensor type is a DS18B20
-    if (ds18B20Address[0] != 0x28) {
-      Serial.print(F("not a DS18B20 sensor: [0]="));
-      Serial.print(ds18B20Address[0], HEX);
-      ds18B20Found = false;
-    }
-  }
-  else {
-    Serial.print(F("no DS18B20 found\n"));
-  }
 }
 
 
 /**
  * loop function (worker thread)
- *
- * state machine:
- *  1..n: measure current ADC values
- *  n+1:  remove highest and lowest value, then create median out of the rest
- *  n+2:  decide new pump and LED states, then set referring outputs
- *  n+3:  print current values, pump and LED states to serial terminal
  */
 void loop() {
-  static int16_t state = 0;             // current state machine state
+    static int16_t  state = 0;                      // current state machine state
 
-  static uint16_t tempRoofArray[eTempSamples];      // samples of roof temp sensor
-  static uint16_t tempRoofAdc;                      // roof temp ADC value
-  static uint8_t  tempRoof;                         // resulting roof temp value
-
-  static uint16_t tempWaterArray[eTempSamples];     // samples of water temp sensor
-  static uint16_t tempWaterAdc;                     // water temp ADC value
-  static uint8_t  tempWater;                        // resulting water temp value
-
-  static uint16_t tempSetArray[eTempSamples];       // samples of set temperature potentiometer
-  static uint16_t tempSetAdc;                       // set temp ADC value
-  static uint8_t  tempSet;                          // resulting set temp value
-
-  static bool     pump       = false;               // current pump state
-  static uint8_t  portStates = 0;                   // current LEDs states
-
-  if (state < eTempSamples) {
-    // sample phases
-
-    // switch power supply for measurement resistors ON
-    digitalWrite(eOutPinMeassure, HIGH);
-    
-    // meassure
-    tempRoofArray[state]  = analogRead(eTempPinRoof);
-    tempWaterArray[state] = analogRead(eTempPinWater);
-    tempSetArray[state]   = analogRead(eTempPinSet);
-  }
-  else
-  switch (state) {
-    case eStateMedian:
-      // switch power supply for measurement resistors OFF
-      digitalWrite(eOutPinMeassure, LOW);
-
-      // sort phase
-      tempRoofAdc  = simpleSort(tempRoofArray,  sizeof(tempRoofArray)  / sizeof(tempRoofArray[0]));
-      tempWaterAdc = simpleSort(tempWaterArray, sizeof(tempWaterArray) / sizeof(tempWaterArray[0]));
-      tempSetAdc   = simpleSort(tempSetArray,   sizeof(tempSetArray)   / sizeof(tempSetArray[0]));
-      break;
-
-    case eStateConversion:
-    {
-        tempRoof  = tempConversion(tempRoofAdc,  adcRoofTempValues);
-        tempWater = tempConversion(tempWaterAdc, adcWaterTempValues);
-        tempSet   = tempConversion(tempSetAdc,   potiTempValues);
-    }
-
-    case eStateAction:
-    {
-      static bool toggleLed = false;
-
-      portStates = 0;           // re-init ports
-
-      // action phases
-      if (tempWater < tempSet) {
-        // water too cold
-        portStates |= eLedHeat;
-        if ((!pump && (tempRoof > tempWater + eTempHysteresis)) || (pump && (tempRoof > tempWater))) {
-          // either pump already running and roof warmer than water OR pump not running and roof warmer than water + hysteresis
-          pump     = true;
+    // in case of error don't start anything but blink error code!
+    if (isError()) {
+        // clear all output ports in error case
+        for (uint8_t index = 0; index < sizeof(pins); index++) {
+            digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
         }
-        else {
-          pump     = false;
-          portStates |= eLedMatch;
-        }
-      }
-      else
-      if (tempWater > tempSet) {
-        // water too warm
-        portStates |= eLedCool;
-        if ((!pump && (tempRoof < tempWater - eTempHysteresis)) || (pump && (tempRoof < tempWater))) {
-          pump     = true;
-        }
-        else {
-          pump     = false;
-          portStates |= eLedMatch;
-        }
-      }
-      else {
-        // water matches
-        pump = false;
-        portStates |= eLedMatch;
-      }
-
-      // danger of frost?
-      if (tempRoof < eTempFrost) {
-        portStates |= eLedFrost;
-      }
-
-      // toggle LED currently ON?
-      if (toggleLed) {
-        portStates |= eLedOnBoard;
-      }
-      toggleLed = !toggleLed;
-
-      // pump ON?
-      if (pump) {
-        portStates |= eOutPump;
-      }
-
-
-      // set/clear output ports dependent on set bits in ports mask
-      for (uint8_t index = 0; index < 16; index++) {
-        if (portStates & (1 << index)) {
-          digitalWrite(pins[index], pinsActive[index]);        // set pin to "ON", real state depends on output type, low or high active!
-        }
-        else {
-          digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
-        }
-      }
-      // @todo falls lastError != 0 dann statt der LEDs den Error Code blinken!
-
-      break;
-    }
-
-    case eStateOneWire:
-      // get 1-wire temperature
-      if (ds18B20Found) {
-        enum {
-          eStartOneWireMeasurement    = 0x44,
-          eStartOneWireScratchPadRead = 0xBE,
-        };
-
-        ds1820.reset();
-        ds1820.skip();                                        // don't select specific sensor since there is only one supported!
-        ds1820.write(eStartOneWireMeasurement, 0);            // start measurement, parasitic supply OFF
-        delay(1000);                                          // wait 1 second
-        ds1820.reset();
-        ds1820.skip();                                        // don't select specific sensor since there is only one supported!
-
-        // read scratch pad
-        ds1820.write(eStartOneWireScratchPadRead);
-        for (uint8_t loop = 0; loop < 9; loop++) {
-          ds18B20Data[loop] = ds1820.read();
-        }
-
-        // calculate real temperature from DS18B20
-        uint16_t tempRaw = (ds18B20Data[1] << 8) | ds18B20Data[0];
-        if (tempRaw & 0x8000) {
-          // we don't need negative values so clear them to ZERO for simplier calculation
-          tempRaw = 0;
-        }
-
-        // we calculate temp from DS18B20 in 1/100°C so we don't need any floating point values!
-        ds18B20Value  = tempRaw / 16 * 100;                     // value from sensor = 16 * temp, so integer temp is value / 16, * 100 to get a fixed point value with two positions after decimal point
-        tempRaw       = (tempRaw % 16) * 100 / 16;              // fract part of temp is rest of tem * 100 to get two decimal point positions and / 16 to get real value
-        ds18B20Value += tempRaw;                                // concat integer part and fraction part together to get a value that contains [1/100°C] value
-      }
-
-      break;
-
-    case eStatePrint:
-      // print phases
-      Serial.print(F("Roof: "));
-      Serial.print(tempRoof, DEC);
-      Serial.print(F("°C / Water: "));
-      Serial.print(tempWater, DEC);
-      Serial.print(F("°C / Set: "));
-      Serial.print(tempSet, DEC);
-      Serial.print(F("°C / Pump: "));
-      Serial.print(pump, DEC);
-      Serial.print(F(" / LEDs: 0x"));
-      Serial.print(portStates, HEX);
-
-      if (ds18B20Found) {
-        Serial.print(F(" / DS18B20: "));
-
-        if (OneWire::crc8(ds18B20Data, sizeof(ds18B20Data) - 1) != ds18B20Data[sizeof(ds18B20Data) - 1]) {
-          Serial.print(F("CRC invalid, ignore it!"));
-        }
-        else {
-          Serial.print(ds18B20Value / 100, DEC);
-          Serial.print(F("."));
-          Serial.print(ds18B20Value - (ds18B20Value / 100 * 100), DEC);
-          Serial.print(F(" °C/100 / DS18B20 data: "));
-
-          for (uint8_t index = 0; index < sizeof(ds18B20Data); index++) {
-            if (ds18B20Data[index] < 0x10) {
-              Serial.print(F("0"));
+        
+        while(1) {      // endless loop in error case
+            for (uint8_t blinkenLights = 0; blinkenLights < errorBuffer[0]; blinkenLights++) {
+                digitalWrite(eLedPinError, LOW);
+                delay(500);
+                digitalWrite(eLedPinError, HIGH);
+                delay(500);
             }
-            Serial.print(ds18B20Data[index], HEX);
-            Serial.print(F(" "));
-          }
+            delay(2000);
+    
+            printErrorBuffer();
+            printInformation();
         }
-      }
-      Serial.print(F("\n"));
+    }
 
-      Serial.print(F("Roof ADCs: "));
-      for (uint8_t loop = 0; loop < sizeof(tempRoofArray)  / sizeof(tempRoofArray[0]); loop++) {
-        Serial.print(tempRoofArray[loop], HEX);
-        Serial.print(F(" "));
-      }
-      Serial.print(F("\n"));
-      Serial.print(F("Water ADCs: "));
-      for (uint8_t loop = 0; loop < sizeof(tempWaterArray)  / sizeof(tempWaterArray[0]); loop++) {
-        Serial.print(tempWaterArray[loop], HEX);
-        Serial.print(F(" "));
-      }
-      Serial.print(F("\n"));
-      Serial.print(F("Set ADCs: "));
-      for (uint8_t loop = 0; loop < sizeof(tempSetArray)  / sizeof(tempRoofArray[0]); loop++) {
-        Serial.print(tempSetArray[loop], HEX);
-        Serial.print(F(" "));
-      }
-      Serial.print(F("\n"));
+    // in case of no error execute state machine
+    if (state < eTempSamples) {
+        // sample phases
+        tempSetArray[state]   = analogRead(eTempPinSet);
+    }
+    else {
+        switch (state) {
+            case eStateMedian:      // sort phase for measured set temperatures
+                tempSetAdc = simpleSort(tempSetArray, sizeof(tempSetArray) / sizeof(tempSetArray[0]));
+                break;
+    
+            case eStateConversion:  // convert set temperature
+                tempSet = tempConversion(tempSetAdc, potiTempValues) * 100;
+                break;
+    
+            case eStateOneWire:     // get 1-wire temperatures
+                static uint8_t sensorIndex = 0;
+                
+                // get temperature from one sensor (otherwise state machine cycle will take too long!)
+                sensorTemp[sensorIndex] = getSensorTemperature(sensorAddresses[sensorIndex], sensorData[sensorIndex]);
 
-      state = -1;   // set state machine back to first state
+                if (digitalRead(eInPinDebugWater) == LOW) {
+                    if (sensorIndex == eSensorIndexWater) {
+                        sensorTemp[eSensorIndexWater] += 500;
+                    }
+                }
+                else
+                if (digitalRead(eInPinDebugRoof) == LOW) {
+                    if (sensorIndex == eSensorIndexRoof) {
+                        sensorTemp[eSensorIndexRoof] += 500;
+                    }
+                }
+    
+                // select next sensor index
+                sensorIndex++;
+                if (sensorIndex >= eSensorIndexMax) {
+                    sensorIndex = 0;
+                }
+                break;
 
-      /* @todo analog Ports Kondensator entladen
-       *  pinMode(xx, OUTPUT);
-       *  digitalWrite(xx, LOW);
-       *  delay(1250);
-       *  pinMode(xx, INPUT);
-       * ggf. auch in der setup() funktion schon mal!!!
-       */
+            case eStateAction:
+            {
+                static bool toggleLed = false;
+    
+                portStates = 0;           // re-init ports
+    
+                // action phases
+                if (sensorTemp[eSensorIndexWater] < tempSet) {
+                    // water too cold
 
-      // if there is a DS18B20 then we have already 1 second break... if not we need one here!
-      if (!ds18B20Found) {
-        delay(1000);
-      }
+                    /* To get some hysteresis pump will be ON when:
+                     *  - if pump is OFF while roof temp > water temp + hysteresis
+                     *  - if pump is ON  while roof temp > water temp
+                     */
 
-      Serial.print(F("--------------------------------------------\n"));
+                    portStates |= eLedHeat;
+                    if ((!pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater] + eTempHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater]))) {
+                        // either pump already running and roof warmer than water OR pump not running and roof warmer than water + hysteresis
+                        pump     = true;
+                    }
+                    else {
+                        pump     = false;
+                        portStates |= eLedMatch;
+                    }
+                }
+                else if (sensorTemp[eSensorIndexWater] > tempSet) {
+                    // water too warm
 
-      break;
+                    /* To get some hysteresis pump will be ON when:
+                     *  - if pump is OFF while roof temp < water temp - hysteresis
+                     *  - if pump is ON  while roof temp < water temp
+                     */
 
-    default:
-      Serial.print(F("unexpected state: "));
-      Serial.print(state, DEC);
-      Serial.print(F("\n"));
-      assert(false, eError_0002);
+                    portStates |= eLedCool;
+                    if ((!pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater] - eTempHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater]))) {
+                        pump     = true;
+                    }
+                    else {
+                        pump     = false;
+                        portStates |= eLedMatch;
+                    }
+                }
+                else {
+                    // water matches
+                    pump = false;
+                    portStates |= eLedMatch;
+                }
+    
+                // danger of frost?
+                if (sensorTemp[eSensorIndexRoof] < eTempFrost) {
+                    portStates |= eLedFrost;
+                }
+    
+                // toggle LED currently ON?
+                if (toggleLed) {
+                    portStates |= eLedOnBoard;
+                }
+                toggleLed = !toggleLed;
+    
+                // pump ON?
+                if (pump) {
+                    portStates |= eOutPump;
+                }
+   
+    
+                // set/clear output ports dependent on set bits in ports mask
+                for (uint8_t index = 0; index < sizeof(pins); index++) {
+                    if (portStates & (1 << index)) {
+                        digitalWrite(pins[index], pinsActive[index]);        // set pin to "ON", real state depends on output type, low or high active!
+                    }
+                    else {
+                        digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
+                    }
+                }
 
-      state = -1;   // set state machine back to first state
-      break;
-  }
+                break;
+            }
 
-  state++;
+        case eStatePrint:
+            // print phases
+            printInformation();
+
+            state = -1;   // set state machine back to first state
+
+            /* @todo analog Ports Kondensator entladen
+             *  pinMode(xx, OUTPUT);
+             *  digitalWrite(xx, LOW);
+             *  delay(1250);
+             *  pinMode(xx, INPUT);
+             * ggf. auch in der setup() funktion schon mal!!!
+             */
+
+            break;
+
+            default:
+                assert(false, eError_0002);
+    
+                state = -1;   // set state machine back to first state
+                break;
+        }
+    }
+    state++;
 }
