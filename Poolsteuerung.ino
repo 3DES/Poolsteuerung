@@ -140,6 +140,12 @@
  *
  */
 
+// all following DEBUG defines are only active if DEBUG is also defined, so with DEBUG all debugging stuff can be enabled and disabled!
+//#define DEBUG                   // define for DEBUG enabled
+#define SENSOR_FOUND            // define to simulate sensors even if none is connected
+#define TEMPERATURE_READ        // define to simulate sensor temperature read even if no sensor has been connected
+#define TEMPERATURE_SET         // define to simulate potentiometer read even if no potentiometer has been connected
+#define DEBUG_PINS              // manipulate measured water and roof temp by setting a debug pin to LOW
 
 #include <OneWire.h>
 
@@ -149,9 +155,9 @@
 #define D1   1              // TX
 #define D2   2              // one wire bus
 #define D3   3              // pump ON + heater valve closed (closed means water is pumped to the roof)
-#define D4   4              //
+#define D4   4              // set to low increases roof  temp by 5°C (for debugging)
 #define D5   5              // set to low increases water temp by 5°C (for debugging)
-#define D6   6              // set to low increases roof  temp by 5°C (for debugging)
+#define D6   6              // debug output pin (toggled n times for simple debugging)
 #define D7   7              // LED red   "heizen"
 #define D8   8              // LED red   "Solltemperatur erreicht"
 #define D9   9              // LED green "kühlen"
@@ -177,8 +183,31 @@
 #define A7  7               //
 
 
+#if defined DEBUG && defined TEMPERATURE_READ
+uint16_t fakeTempRoof  = 20 * 100;      // 20°C fake temp in case of debugging
+uint16_t fakeTempWater = 20 * 100;      // 20°C fake temp in case of debugging
+#endif
+#if defined DEBUG && defined TEMPERATURE_SET
+uint16_t fakeTempSet   = 20 * 100;      // 20°C fake temp in case of debugging
+#endif
+#if defined DEBUG && (defined TEMPERATURE_READ || defined TEMPERATURE_SET)
+enum { eFakeTempStep = 50 };       // increment/decrement fake temps by 0.5°C
+#endif
+
+
+
+/**
+ * error buffer variables
+ */
 uint16_t errorBuffer[10];           // to store any error for blinken lights if any happened
 uint16_t errorBufferIndex = 0;      // index where next error can be stored
+
+
+/**
+ * print enable/disable variables
+ */
+bool printAdcConversion = false;    // set to TRUE to print ADC conversion information
+bool printVariables     = false;    // set to TRUE to print variables every state machine turn
 
 
 /**
@@ -194,18 +223,37 @@ enum {
  * some constant values
  */
 enum {
-    eTempHysteresis      = 300,  // don't start pump until temp > temp +/- hysteresis has been reached (unit: 1/100°C)
-    eTempMatchHysteresis = 50,   // show "match" when water temp within set temp +/- match hysteresis (+/- 0.5°C)
+    eTempOnHysteresis    = 500,  // start pump when roof temp >  water temp +/- ON hysteresis (unit: 1/100°C)
+    eTempOffHysteresis   = 300,  // stop  pump when roof temp <= water temp +/- OFF hysteresis (unit: 1/100°C)
+    eTempMatchHysteresis = 50,   // show "match" when water temp within set temp +/- MATCH hysteresis (unit: 1/100°C)
     eTempFrost           = 5,    // show frost when this temp or less has been reached
-
     eTempSamples         = 6,    // amount of temp samples (must be 2^n+2 because of sort and median algorithm!)
-    eStateMedian         = eTempSamples,
+};
+
+
+
+enum { eResumableErrorThreshold = 5 };
+uint8_t resumableError = 0;                 // count errors until threshold reached
+
+
+/**
+ * states for loop state machine
+ */
+enum {
+    eStateInitial        = 0,
+    eStateSamplePhase,
+    eStateMedian,
     eStateConversion,
     eStateOneWire,
     eStateAction,
     eStatePrint,
+
+    eStateInitialError,
+    eStateOneWireError,
+    eStateHaltError,
 };
 
+// @todo Poti in Steuerung nochmal durchmessen ob ADC-Werte noch stimmen (Versorgungsspannung hat sich ja verändert!!!)
 
 /**
  * uniq error values
@@ -237,8 +285,9 @@ enum {
     eOutPinOneWire   = D2,      // one wire pin (to setup temperature values)
     eOutPinPump      = D3,      // pin for pump relais
 
-    eInPinDebugWater = D4,
-    eInPinDebugRoof  = D5,
+    eInPinDebugRoof  = D4,      // if set to 1 roof  temperature will be incremented by 5°C for testing
+    eInPinDebugWater = D5,      // if set to 1 water temperature will be incremented by 5°C for testing
+    eOutPinDebug     = D6,      // toggled several times at different code positions for simple debugging
 
     eLedPinHeat      = D7,      // LED pin for heating
     eLedPinMatch     = D8,      // LED pin if set temperature reached
@@ -270,10 +319,11 @@ enum {
     eOutPump    = 1 << eOutPumpIndex   ,   // ON in case pump is running and heater valve has to be closed (= heating/cooling)
 };
 //                   enum Bits:  eLedHeat     eLedMatch     eLedCool     eLedFrost     eLedOnBoard     eOutPump
-const uint8_t pins[]               = {eLedPinHeat, eLedPinMatch, eLedPinCool, eLedPinFrost, eLedPinOnBoard, eOutPinPump};          // order should be identical with previous enum!!!
-const uint8_t pinsActive[]         = {LOW,         LOW,          LOW,         LOW,          HIGH,           HIGH};                 // value to set refering output to ON
+const uint8_t pins[]               = {eLedPinHeat, eLedPinMatch, eLedPinCool, eLedPinFrost, eLedPinOnBoard, eOutPinPump};       // order should be identical with previous enum!!!
+const uint8_t pinsActive[]         = {LOW,         LOW,          LOW,         LOW,          HIGH,           HIGH};              // values to set refering output to ON
 const char    pinsOnNames[][6][10] = {{"heat",     "match",      "cool",      "frost",      "onboard",      "pump"},
                                       {"HEAT",     "MATCH",      "COOL",      "FROST",      "ONBOARD",      "PUMP"}};
+const uint8_t pinsInitial[]        = {LOW,         LOW,          LOW,         LOW,          HIGH,           LOW};               // values to initialize refering outputs
 
 
 // indices for following sensorAddresses array
@@ -331,23 +381,91 @@ static inline bool isError(void) {
 
 
 /**
+ * Clear error buffer, e.g. in case error disappeared
+ * It's helpful in the case that it was possible to "re-setup" after an error happened, e.g. during initialization phase by doing it again
+ */
+static inline void clearErrorBuffer(void) {
+    errorBufferIndex = 0;
+}
+
+
+/**
+ * Blinks given error code to frost and onboard LED
+ *
+ * @error   error value to blink
+ */
+void blinkError(uint16_t error) {
+    for (uint8_t blinkenLights = 0; blinkenLights < error; blinkenLights++) {
+        // LEDs on
+        digitalWrite(eLedPinError,   pinsActive[eLedFrostIndex]);       // for user
+        digitalWrite(eLedPinOnBoard, pinsActive[eLedOnBoardIndex]);     // for debugging
+        delay(500);
+
+        // LEDs off
+        digitalWrite(eLedPinError,   !pinsActive[eLedFrostIndex]);      // for user
+        digitalWrite(eLedPinOnBoard, !pinsActive[eLedOnBoardIndex]);    // for debugging
+        delay(500);
+    }
+    delay(2000);
+}
+
+
+/**
+ * Toggles debug pin for n times and waits 50ms afterwards, so debugging with analyzer will become possible
+ */
+#if defined DEBUG
+void debugToggle(uint8_t amount) {
+    while (amount--) {
+        digitalWrite(eOutPinDebug, HIGH);
+        digitalWrite(eOutPinDebug, LOW);
+    }
+    delay(1);
+}
+#else
+#   define debugToggle(x)           /* remove that code if DEBUG is not activated! */
+#endif
+
+
+/**
  * assert function to check something and set error if necessary
  *
  * @successful      true in case test was OK, false if test failed
  * @error           uniq error number to be stored
  */
-static inline bool assert(bool successful, eError_mt error) {
+bool assert(bool successful, eError_mt error) {
     if (!successful) {
-        Serial.print(F("Error: "));
-        Serial.println(error);
 
+        digitalWrite(eLedPinOnBoard, !pinsActive[eLedOnBoardIndex]);        // for debugging
+        delay(5);
+        for (uint16_t toggle = 0; toggle < error; toggle++) {
+            digitalWrite(eLedPinOnBoard, pinsActive[eLedOnBoardIndex]);     // for debugging
+            digitalWrite(eLedPinOnBoard, !pinsActive[eLedOnBoardIndex]);    // for debugging
+        }
+        delay(1);
+        
         // store error in case error buffer is not yet full
         if (errorBufferIndex < sizeof(errorBuffer)/sizeof(errorBuffer[0])) {
-            errorBuffer[errorBufferIndex++] = error;
+
+            // don't set same error twice directly one after another
+            if ((errorBufferIndex == 0) || (errorBuffer[errorBufferIndex - 1] != error)) {
+                errorBuffer[errorBufferIndex] = error;
+                errorBufferIndex++;
+            }
         }
     }
 
     return successful;
+}
+
+
+/**
+ * sets all outputs to "OFF" state
+ */
+void shutOff(void) {
+    // clear all output ports in error case
+    for (uint8_t index = 0; index < sizeof(pins); index++) {
+        digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
+    }
 }
 
 
@@ -411,8 +529,10 @@ uint8_t tempCalculation(uint16_t adcValue, uint16_t lowTempDegree, uint16_t high
     uint8_t result;
     uint16_t degreeDelta = highTempDegree - lowTempDegree;
 
-    Serial.print(F("Calculate: degreeDelta: "));
-    Serial.print(degreeDelta, DEC);
+    if (printAdcConversion) {
+        Serial.print(F("Calculate: degreeDelta: "));
+        Serial.print(degreeDelta, DEC);
+    }
 
     if (adcValue == lowTempAdc) {
         result = lowTempDegree;           // match with low temp ADC value found
@@ -443,15 +563,19 @@ uint8_t tempCalculation(uint16_t adcValue, uint16_t lowTempDegree, uint16_t high
 
         result = lowTempDegree + (uint8_t)((((uint32_t)degreeDelta) * adcValue) / adcDelta);      // uint32_t is necessary to prevent overflows... '*' before '/' is necessary to reduce rounding errors
 
-        Serial.print(F(" / adcValue: "));
-        Serial.print(adcValue, HEX);
-        Serial.print(F(" / adcDelta: "));
-        Serial.print(adcDelta, HEX);
+        if (printAdcConversion) {
+            Serial.print(F(" / adcValue: "));
+            Serial.print(adcValue, HEX);
+            Serial.print(F(" / adcDelta: "));
+            Serial.print(adcDelta, HEX);
+        }
     }
 
-    Serial.print(F(" / result degree: "));
-    Serial.print(result, DEC);
-    Serial.print(F("\n"));
+    if (printAdcConversion) {
+        Serial.print(F(" / result degree: "));
+        Serial.print(result, DEC);
+        Serial.print(F("\n"));
+    }
 
     return result;
 }
@@ -472,10 +596,12 @@ uint8_t tempConversion(uint16_t adcValue, const uint16_t * const tempArray) {
     uint16_t nextValue = tempArray[1];            // need to read second value from array to decide type of temp sensor (NTC or PTC)
     bool     PTC       = (value > nextValue);     // if first value is larger than second one it must be a PTC, otherwise it's an NTC
 
-    Serial.print(F("Convert: "));
-    Serial.print(PTC ? F("PTC") : F("NTC"));
-    Serial.print(F(" / adc: "));
-    Serial.print(adcValue, HEX);
+    if (printAdcConversion) {
+        Serial.print(F("Convert: "));
+        Serial.print(PTC ? F("PTC") : F("NTC"));
+        Serial.print(F(" / adc: "));
+        Serial.print(adcValue, HEX);
+    }
 
     // find temperature range
     if (adcValue <= value) {
@@ -511,44 +637,53 @@ uint8_t tempConversion(uint16_t adcValue, const uint16_t * const tempArray) {
         }
     }
 
-    Serial.print(F(" / adc new: "));
-    Serial.print(adcValue, HEX);
-    Serial.print(F(" / lowIndex: "));
-    Serial.print(lowIndex, DEC);
-    Serial.print(F(" / highIndex: "));
-    Serial.print(highIndex, DEC);
-    Serial.print(F(" / lowValue: "));
-    Serial.print(value, HEX);
-    Serial.print(F(" / nextValue: "));
-    Serial.print(nextValue, HEX);
-    Serial.print(F("\n"));
+    if (printAdcConversion) {
+        Serial.print(F(" / adc new: "));
+        Serial.print(adcValue, HEX);
+        Serial.print(F(" / lowIndex: "));
+        Serial.print(lowIndex, DEC);
+        Serial.print(F(" / highIndex: "));
+        Serial.print(highIndex, DEC);
+        Serial.print(F(" / lowValue: "));
+        Serial.print(value, HEX);
+        Serial.print(F(" / nextValue: "));
+        Serial.print(nextValue, HEX);
+        Serial.print(F("\n"));
+    }
 
     return tempCalculation(adcValue, 10 + (5 * lowIndex), 10 + (5 * highIndex), value, nextValue);
 }
 
 
 /**
- * Reads temperature from DS18B20 sensor, stores data in given data array (e.g. for print) and returns received temperature
- * In case of error an error will be stored.
+ * 1-wire commands
+ */
+enum {
+    eStartOneWireMeasurement    = 0x44,
+    eStartOneWireScratchPadRead = 0xBE,
+};
+
+
+/**
+ * initiates 1-wire measurement.
+ * after calling this function you should watit ~1 second before reading scratch pad!
  *
  * @sensorAddress   address of DS18B20 to be read
- * @data            to store raw received sensor data
- *
- * @return          temperature in 1/100°C
  */
-uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
-    enum {
-        eStartOneWireMeasurement    = 0x44,
-        eStartOneWireScratchPadRead = 0xBE,
-    };
-
-    uint16_t result;
-
-    // initiate measurement
+void initiateSensorMeasurement(const uint8_t * sensorAddress) {
     ds1820.reset();
     ds1820.select(sensorAddress);                   // select sensor
     ds1820.write(eStartOneWireMeasurement, 0);      // initiate measurement
-    delay(1000);                                    // wait 1 second (>= 750ms!)
+}
+
+
+/**
+ * reads 1-wire scratch pad
+ *
+ * @sensorAddress   address of DS18B20 to be read
+ */
+uint16_t readSensorScratchpad(const uint8_t * sensorAddress, uint8_t * data) {
+    uint16_t result;
 
     // read temperature
     ds1820.reset();
@@ -575,6 +710,24 @@ uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
     result += rawTemp;                                // concat integer part and fraction part together to get a value that contains [1/100°C] value
 
     return result;
+}
+
+
+/**
+ * Reads temperature from DS18B20 sensor, stores data in given data array (e.g. for print) and returns received temperature
+ * In case of error an error will be stored.
+ *
+ * @sensorAddress   address of DS18B20 to be read
+ * @data            to store raw received sensor data
+ *
+ * @return          temperature in 1/100°C
+ */
+uint16_t getSensorTemperature(const uint8_t * sensorAddress, uint8_t * data) {
+    // initiate measurement
+    initiateSensorMeasurement(sensorAddress);
+    delay(1000);                                    // wait 1 second (>= 750ms!)
+
+    return readSensorScratchpad(sensorAddress, data);
 }
 
 
@@ -670,13 +823,38 @@ void printInformation(void) {
 }
 
 
+/**
+ * To print error buffer content
+ */
 void printErrorBuffer(void) {
     for (uint8_t index = 0; index < errorBufferIndex; index++) {
-        Serial.print(F("Error: "));
+        Serial.print(F("Error "));
+        Serial.print(index, DEC);
+        Serial.print((": "));
         Serial.print(errorBuffer[index], HEX);
         Serial.println("");
     }
     Serial.println("");
+}
+
+
+/**
+ * To print error buffer content
+ */
+void printHelp(void) {
+    Serial.print(F("h: print this help screen\n"));
+    Serial.print(F("a: print ADC conversion ON/OFF\n"));
+    Serial.print(F("p: print variables ON/OFF\n"));
+#if defined DEBUG && defined TEMPERATURE_READ
+    Serial.print(F("w: decrement faked water temperature by 0.5°C\n"));
+    Serial.print(F("W: increment faked water temperature by 0.5°C\n"));
+    Serial.print(F("r: decrement faked roof  temperature by 0.5°C\n"));
+    Serial.print(F("R: increment faked roof  temperature by 0.5°C\n"));
+#endif
+#if defined DEBUG && defined TEMPERATURE_SET
+    Serial.print(F("s: decrement faked set temperature by 0.5°C\n"));
+    Serial.print(F("S: increment faked set temperature by 0.5°C\n"));
+#endif
 }
 
 
@@ -687,9 +865,10 @@ void setup() {
     // put your setup code here, to run once:
     Serial.begin(9600);           //  setup serial
 
-    // initialize debug inputs
-    pinMode(eInPinDebugWater, INPUT_PULLUP);
+    // initialize debug pins
     pinMode(eInPinDebugRoof,  INPUT_PULLUP);
+    pinMode(eInPinDebugWater, INPUT_PULLUP);
+    pinMode(eOutPinDebug,     OUTPUT);
 
     // initialize outputs
     pinMode(eOutPinPump,      OUTPUT);
@@ -701,44 +880,12 @@ void setup() {
     pinMode(eLedPinFrost,     OUTPUT);
     pinMode(eLedPinOnBoard,   OUTPUT);
 
-    // search for a 1-wire sensors (first two supported all others will just be shown), 1st one is water temp, 2nd one is roof temp
-    uint8_t address[8];
-    ds1820.reset();
-    while (ds1820.search(address)) {
-        Serial.print(F("found DS18B20: "));
-        printHexBytes(address, eDs18B20LengthAddress);
-
-        if (!assert(OneWire::crc8(address, eDs18B20LengthAddress - 1) == address[eDs18B20LengthAddress - 1], eError_0007)) {
-            Serial.print(F(" : invalid CRC"));
-        }
-        else
-        if (!assert(!memncmpx(address, eDs18B20LengthAddress, 0x00), eError_000C)) {
-            Serial.print(F(" : zero data"));
-        }
-        else {
-            if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexRoof], sizeof(sensorAddresses[eSensorIndexRoof])) == 0) {
-                sensorFound[eSensorIndexRoof] = true;
-            }
-            else
-            if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexWater], sizeof(sensorAddresses[eSensorIndexWater])) == 0) {
-                sensorFound[eSensorIndexWater] = true;
-            }
-            else {
-                assert(false, eError_0008);
-            }
-        }
-        Serial.println("");
+    // initialize output values
+    for (uint8_t index = 0; index < sizeof(pins); index++) {
+        digitalWrite(pins[index], pinsInitial[index]);       // set pin to initial value
     }
 
-    assert(sensorFound[eSensorIndexRoof],  eError_0009);
-    assert(sensorFound[eSensorIndexWater], eError_000A);
-
-    if (!isError()) {
-        for (uint8_t index = 0; index < eSensorIndexMax; index++) {
-            sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
-            sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
-        }
-    }
+    printHelp();
 }
 
 
@@ -746,185 +893,407 @@ void setup() {
  * loop function (worker thread)
  */
 void loop() {
-    static int16_t  state = 0;                      // current state machine state
+    static int16_t  state = eStateInitial;          // current state machine state
 
-    // in case of error don't start anything but blink error code!
-    if (isError()) {
-        // clear all output ports in error case
-        for (uint8_t index = 0; index < sizeof(pins); index++) {
-            digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
-        }
+    debugToggle(1);
 
-        while(1) {      // endless loop in error case
-            for (uint8_t blinkenLights = 0; blinkenLights < errorBuffer[0]; blinkenLights++) {
-                digitalWrite(eLedPinError,   pinsActive[eLedFrostIndex]);       // for user
-                digitalWrite(eLedPinOnBoard, pinsActive[eLedOnBoardIndex]);     // for debugging
-                delay(500);
-                digitalWrite(eLedPinError,   !pinsActive[eLedFrostIndex]);      // for user
-                digitalWrite(eLedPinOnBoard, !pinsActive[eLedOnBoardIndex]);    // for debugging
-                delay(500);
-            }
-            delay(2000);
-
-            printErrorBuffer();
-            printInformation();
-        }
-    }
-
-    // in case of no error execute state machine
-    if (state < eTempSamples) {
-        // sample phases
-        tempSetArray[state]   = analogRead(eTempPinSet);
+    if (state <= eStateHaltError) {
+        debugToggle(state + 1);
     }
     else {
-        switch (state) {
-            case eStateMedian:      // sort phase for measured set temperatures
-                tempSetAdc = simpleSort(tempSetArray, sizeof(tempSetArray) / sizeof(tempSetArray[0]));
-                break;
+        debugToggle(eStateHaltError + 10);
+    }
 
-            case eStateConversion:  // convert set temperature
-                tempSet = tempConversion(tempSetAdc, potiTempValues) * 100;
-                break;
+    switch (state) {
+        case eStateInitial:
+        {
+            clearErrorBuffer();           // clear errors in case we are here not for the first time... in that case try to initialize again and again and again...
 
-            case eStateOneWire:     // get 1-wire temperatures
-                static uint8_t sensorIndex = 0;
+            // search for a 1-wire sensors (first two supported all others will just be shown), 1st one is water temp, 2nd one is roof temp
+            uint8_t address[8];
+            ds1820.reset_search();
+            ds1820.reset();
+            while (ds1820.search(address)) {
+                Serial.print(F("found DS18B20: "));
+                printHexBytes(address, eDs18B20LengthAddress);
 
-                // get temperature from one sensor (otherwise state machine cycle will take too long!)
-                sensorTemp[sensorIndex] = getSensorTemperature(sensorAddresses[sensorIndex], sensorData[sensorIndex]);
-
-                if (digitalRead(eInPinDebugWater) == LOW) {
-                    if (sensorIndex == eSensorIndexWater) {
-                        sensorTemp[eSensorIndexWater] += 500;
-                    }
+                if (!assert(OneWire::crc8(address, eDs18B20LengthAddress - 1) == address[eDs18B20LengthAddress - 1], eError_0007)) {
+                    Serial.print(F(" : invalid CRC"));
                 }
                 else
-                if (digitalRead(eInPinDebugRoof) == LOW) {
-                    if (sensorIndex == eSensorIndexRoof) {
-                        sensorTemp[eSensorIndexRoof] += 500;
-                    }
-                }
-
-                // select next sensor index
-                sensorIndex++;
-                if (sensorIndex >= eSensorIndexMax) {
-                    sensorIndex = 0;
-                }
-                break;
-
-            case eStateAction:
-            {
-                /* initially we start with "MATCH" per default
-                 *  - if water is colder than set temp - 1.0°C then "HEAT" is selected
-                 *  - if "HEAT" was already selected it stays selected as long as water is colder than set temp + 0.5°C so it won't toggle between heating and cooling
-                 *  - if "HEAT" was already selected and water reaches set temp + 0.5°C then "MATCH" will be selected
-                 *  - if water is warmer than set temp + 1.0°C then "COOL" is selected
-                 *  - if "COOL" was already selected it stays selected as long as water is warmer than set temp - 0.5°C so it won't toggle between heating and cooling
-                 *  - if "COOL" was already selected and water reaches set temp - 0.5°C then "MATCH" will be selected
-                 *  - if "MATCH" is selected it will stay selected as long as water is within [set temp - 1.0°C, set temp + 1.0°C ]
-                 */
-
-                static bool toggleLed = false;
-
-                portStates = 0;           // re-init ports
-
-                // action phases
-                if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] < tempSet - 2 * eTempMatchHysteresis)) || ((heatCool == eHeatStateHeat) && (sensorTemp[eSensorIndexWater] < tempSet + eTempMatchHysteresis))) {
-                    // water too cold
-                    heatCool = eHeatStateHeat;
-
-                    /* To get some hysteresis pump will be ON when:
-                     *  - if pump is OFF while roof temp > water temp + hysteresis
-                     *  - if pump is ON  while roof temp > water temp
-                     */
-
-                    portStates |= eLedHeat;
-                    if ((!pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater] + eTempHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater]))) {
-                        // either pump already running and roof warmer than water OR pump not running and roof warmer than water + hysteresis
-                        pump     = true;
-                    }
-                    else {
-                        pump     = false;
-                        portStates |= eLedMatch;
-                    }
-                }
-                else if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] > tempSet + 2 * eTempMatchHysteresis)) || ((heatCool == eHeatStateCool) && (sensorTemp[eSensorIndexWater] > tempSet - eTempMatchHysteresis))) {
-                    // water too warm
-                    heatCool = eHeatStateCool;
-
-                    /* To get some hysteresis pump will be ON when:
-                     *  - if pump is OFF while roof temp < water temp - hysteresis
-                     *  - if pump is ON  while roof temp < water temp
-                     */
-
-                    portStates |= eLedCool;
-                    if ((!pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater] - eTempHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater]))) {
-                        pump     = true;
-                    }
-                    else {
-                        pump     = false;
-                        portStates |= eLedMatch;
-                    }
+                if (!assert(!memncmpx(address, eDs18B20LengthAddress, 0x00), eError_000C)) {
+                    Serial.print(F(" : zero data"));
                 }
                 else {
-                    // water matches
-                    heatCool = eHeatStateMatch;
-
-                    pump = false;
-                    portStates |= eLedMatch;
-                }
-
-                // danger of frost?
-                if (sensorTemp[eSensorIndexRoof] < eTempFrost) {
-                    portStates |= eLedFrost;
-                }
-
-                // toggle LED currently ON?
-                if (toggleLed && !isError()) {
-                    portStates |= eLedOnBoard;
-                }
-                toggleLed = !toggleLed;
-
-                // pump ON?
-                if (pump) {
-                    portStates |= eOutPump;
-                }
-
-
-                // set/clear output ports dependent on set bits in ports mask
-                for (uint8_t index = 0; index < sizeof(pins); index++) {
-                    if (portStates & (1 << index)) {
-                        digitalWrite(pins[index], pinsActive[index]);        // set pin to "ON", real state depends on output type, low or high active!
+                    if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexRoof], sizeof(sensorAddresses[eSensorIndexRoof])) == 0) {
+                        sensorFound[eSensorIndexRoof] = true;
+                    }
+                    else
+                    if (strncmp((const char*)address, (const char*)sensorAddresses[eSensorIndexWater], sizeof(sensorAddresses[eSensorIndexWater])) == 0) {
+                        sensorFound[eSensorIndexWater] = true;
                     }
                     else {
-                        digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
+                        assert(false, eError_0008);
                     }
                 }
-
-                break;
+                Serial.println("");
             }
 
-        case eStatePrint:
-            // print phases
-            printInformation();
+            assert(sensorFound[eSensorIndexRoof],  eError_0009);
+            assert(sensorFound[eSensorIndexWater], eError_000A);
 
-            state = -1;   // set state machine back to first state
+#if defined DEBUG && defined SENSOR_FOUND
+            clearErrorBuffer();
+#endif
 
-            /* @todo analog Ports Kondensator entladen
-             *  pinMode(xx, OUTPUT);
-             *  digitalWrite(xx, LOW);
-             *  delay(1250);
-             *  pinMode(xx, INPUT);
-             * ggf. auch in der setup() funktion schon mal!!!
-             */
+            // no error during sensor search?
+            if (!isError()) {
+                for (uint8_t index = 0; index < eSensorIndexMax; index++) {
+                    sensorTemp[index] = getSensorTemperature(sensorAddresses[index], sensorData[index]);
+                }
+            }
+
+#if defined DEBUG && defined TEMPERATURE_READ
+            clearErrorBuffer();
+            sensorTemp[eSensorIndexRoof]  = fakeTempRoof;
+            sensorTemp[eSensorIndexWater] = fakeTempWater;
+#endif
+
+            // no error during temperature read?
+            if (!isError()) {
+                state = eStateSamplePhase;
+                resumableError = 0;         // clear resumable errors if any occurred
+            }
+            else {
+                // in case error happend up to here switch to error handling state
+                state = eStateInitialError;
+            }
+
+            break;
+        }
+
+        case eStateSamplePhase:
+        {
+            static uint8_t sampleCounter = 0;
+
+            tempSetArray[sampleCounter] = analogRead(eTempPinSet);
+
+            sampleCounter = (sampleCounter + 1) % eTempSamples;     // execute this state eTempSamples times!
+
+            // when previous module division sets sampleCounter to zero again one whole set of measurements has been finished
+            if (sampleCounter == 0) {
+                state = eStateMedian;
+            }
+
+            break;
+        }
+
+        case eStateMedian:      // sort phase for measured set temperatures
+            tempSetAdc = simpleSort(tempSetArray, sizeof(tempSetArray) / sizeof(tempSetArray[0]));
+            state = eStateConversion;
 
             break;
 
-            default:
-                assert(false, eError_0002);
+        case eStateConversion:  // convert set temperature
+            tempSet = tempConversion(tempSetAdc, potiTempValues) * 100;
+            state = eStateOneWire;
 
-                state = -1;   // set state machine back to first state
-                break;
+#if defined DEBUG && defined TEMPERATURE_SET
+            clearErrorBuffer();
+            tempSet = fakeTempSet;
+#endif
+
+            break;
+
+        case eStateOneWire:
+        {
+            static uint8_t oneWireCounter = 0;
+
+            enum {
+                eInitiateSensorMeasurement = 0,
+                eReadRoofSensor            = 10,
+                eReadWaterSensor,         // 11
+                eMeasurementLoopTurns,    // 12
+            };
+
+            clearErrorBuffer();           // clear errors in case we are here not for the first time... in that case try to read temperature again and again and again...
+
+
+            /* this state contains different jobs:
+             * 1st      run = initiate measurement at both 1-wire sensors
+             * 2nd..9th run = do nothing
+             * 10th     run = read temperature from first  sensor
+             * 11th     run = read temperature from second sensor
+             *
+             * the delay(100) will ensure that independent from the time all the other states need one complete state machine run will take at least 100ms... so all together we have >= 1 second for the sensors to do their temperature measurements
+             */
+
+            if (oneWireCounter == eInitiateSensorMeasurement) {
+                // initiate temperature measurement on both sensors
+                initiateSensorMeasurement(sensorAddresses[0]);
+                initiateSensorMeasurement(sensorAddresses[1]);
+            }
+            else
+            if (oneWireCounter == eReadRoofSensor) {
+                // read temperatur from first sensor
+                sensorTemp[eSensorIndexRoof] = readSensorScratchpad(sensorAddresses[eSensorIndexRoof], sensorData[eSensorIndexRoof]);
+
+#if defined DEBUG && defined TEMPERATURE_READ
+                clearErrorBuffer();
+                sensorTemp[eSensorIndexRoof] = fakeTempRoof;
+#endif
+
+#if defined DEBUG && defined DEBUG_PINS
+                if (digitalRead(eInPinDebugRoof) == LOW) {
+                    // D5 (= roof temp + 5°C)
+                    sensorTemp[eSensorIndexRoof] += 100;
+                }
+#endif
+            }
+            else
+            if (oneWireCounter == eReadWaterSensor) {
+                // read temperatur from second sensor
+                sensorTemp[eSensorIndexWater] = readSensorScratchpad(sensorAddresses[eSensorIndexWater], sensorData[eSensorIndexWater]);
+
+#if defined DEBUG && defined TEMPERATURE_READ
+                clearErrorBuffer();
+                sensorTemp[eSensorIndexWater] = fakeTempWater;
+#endif
+
+#if defined DEBUG && defined DEBUG_PINS
+                if (digitalRead(eInPinDebugWater) == LOW) {
+                    // D4 (= water temp + 5°C)
+                    sensorTemp[eSensorIndexWater] += 100;
+                }
+#endif
+            }
+
+            // no error so far?
+            if (!isError()) {
+                oneWireCounter = (oneWireCounter + 1) % eMeasurementLoopTurns;
+            }
+            // else "repeat current one wire action"
+
+            delay(100);
+
+            state = eStateAction;
+
+            break;
         }
+
+        case eStateAction:
+        {
+            /* initially we start with "MATCH" per default
+             *  - start HEATing when water is colder than or equal to set temp - 0.5°C
+             *  - stop  HEATing when water is warmer than or equal to set temp + 0.5°C
+             *  - start COOLing when water is warmer than             set temp + 1.0°C
+             *  - stop  COOLing when water is colder than or equal to set temp
+             *  - pump  will be off when water temperature is in: ]set temp - 0.5°C, set temp + 1.0°C]
+             *
+             *  - if HEAT has been chosen 
+             */
+
+            static bool toggleLed = false;
+
+            portStates = 0;           // re-init ports
+
+            // action phases
+            if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] <= tempSet - eTempMatchHysteresis)) || ((heatCool == eHeatStateHeat) && (sensorTemp[eSensorIndexWater] < tempSet + eTempMatchHysteresis))) {
+                // water too cold
+                heatCool = eHeatStateHeat;
+
+                /* To get some hysteresis pump will be ON when:
+                 *  - if pump is OFF while roof temp > water temp + hysteresis
+                 *  - if pump is ON  while roof temp > water temp
+                 */
+
+                portStates |= eLedHeat;
+                if ((!pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater] + eTempOnHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] > sensorTemp[eSensorIndexWater] + eTempOffHysteresis))) {
+                    // either pump already running and roof warmer than water OR pump not running and roof warmer than water + hysteresis
+                    pump     = true;
+                }
+                else {
+                    pump     = false;
+                    portStates |= eLedMatch;
+                }
+            }
+            else if (((heatCool == eHeatStateMatch) && (sensorTemp[eSensorIndexWater] > tempSet + 2 * eTempMatchHysteresis)) || ((heatCool == eHeatStateCool) && (sensorTemp[eSensorIndexWater] > tempSet))) {
+                // water too warm
+                heatCool = eHeatStateCool;
+
+                /* To get some hysteresis pump will be ON when:
+                 *  - if pump is OFF while roof temp < water temp - hysteresis
+                 *  - if pump is ON  while roof temp < water temp
+                 */
+
+                portStates |= eLedCool;
+                if ((!pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater] - eTempOnHysteresis)) || (pump && (sensorTemp[eSensorIndexRoof] < sensorTemp[eSensorIndexWater] + eTempOffHysteresis))) {
+                    pump     = true;
+                }
+                else {
+                    pump     = false;
+                    portStates |= eLedMatch;
+                }
+            }
+            else {
+                // water matches
+                heatCool = eHeatStateMatch;
+
+                pump = false;
+                portStates |= eLedMatch;
+            }
+
+            // danger of frost?
+            if (sensorTemp[eSensorIndexRoof] < eTempFrost) {
+                portStates |= eLedFrost;
+            }
+
+            // toggle LED currently ON?
+            if (toggleLed) {
+                portStates |= eLedOnBoard;
+            }
+            toggleLed = !toggleLed;
+
+            // pump ON?
+            if (pump) {
+                portStates |= eOutPump;
+            }
+
+
+            // set/clear output ports dependent on set bits in ports mask
+            for (uint8_t index = 0; index < sizeof(pins); index++) {
+                if (portStates & (1 << index)) {
+                    digitalWrite(pins[index], pinsActive[index]);        // set pin to "ON", real state depends on output type, low or high active!
+                }
+                else {
+                    digitalWrite(pins[index], !pinsActive[index]);       // set pin to "OFF", real state depends on output type, low or high active!
+                }
+            }
+
+            state = eStatePrint;
+
+            break;
+        }
+
+        case eStatePrint:
+            {
+                // if user connected terminal to read data he/she can also print a key to see something!
+                int userInput = Serial.read();
+
+                if ((char)userInput == 'h') {
+                    printHelp();
+                }
+                else
+                if ((char)userInput == 'a') {
+                    printAdcConversion = !printAdcConversion;
+                }
+                else
+                if ((char)userInput == 'p') {
+                    printVariables = !printVariables;
+                }
+#if defined DEBUG && defined TEMPERATURE_READ
+                else
+                if ((char)userInput == 'w') {
+                    if (fakeTempWater > 0) {
+                        fakeTempWater -= eFakeTempStep;
+                    }
+                }
+                else
+                if ((char)userInput == 'W') {
+                    if (fakeTempWater < 8000) {
+                        fakeTempWater += eFakeTempStep;
+                    }
+                }
+                else
+                if ((char)userInput == 'r') {
+                    if (fakeTempRoof > 0) {
+                        fakeTempRoof -= eFakeTempStep;
+                    }
+                }
+                else
+                if ((char)userInput == 'R') {
+                    if (fakeTempRoof < 8000) {
+                        fakeTempRoof += eFakeTempStep;
+                    }
+                }
+#endif
+#if defined DEBUG && defined TEMPERATURE_SET
+                else
+                if ((char)userInput == 's') {
+                    if (fakeTempSet > 0) {
+                        fakeTempSet -= eFakeTempStep;
+                    }
+                }
+                else
+                if ((char)userInput == 'S') {
+                    if (fakeTempSet < 8000) {
+                        fakeTempSet += eFakeTempStep;
+                    }
+                }
+#endif
+
+                if (printVariables) {
+                    // print phases
+                    printInformation();
+                }
+
+                /* @todo analog Ports Kondensator entladen
+                *  pinMode(xx, OUTPUT);
+                *  digitalWrite(xx, LOW);
+                *  delay(1250);
+                *  pinMode(xx, INPUT);
+                * ggf. auch in der setup() funktion schon mal!!!
+                */
+
+                state = eStateSamplePhase;   // set state machine back to first state
+
+                break;
+            }
+
+        case eStateInitialError:
+        case eStateOneWireError:
+        {
+            blinkError(errorBuffer[0]);
+
+            printErrorBuffer();
+            printInformation();
+
+            // increment resumableError until threshold reached
+            if (resumableError < eResumableErrorThreshold) {
+                resumableError++;
+
+                if (state == eStateInitialError) {
+                    state = eStateInitial;              // stay in eStateInitial until the two expected sensors have been found
+                }
+                else
+                if (state == eStateOneWireError) {
+                    state = eStateOneWire;              // stay in eStateOneWire until reading scratch pad with temperature was successful
+                }
+            }
+            else {
+                // error threshold reached, so switch over to blocking state
+                state = eStateHaltError;
+            }
+
+            break;
+        }
+
+        default:
+            assert(false, eError_0002);
+            // fallthrough
+        case eStateHaltError:
+            // never leave this state again!
+            shutOff();
+
+            blinkError(errorBuffer[0]);
+
+            printErrorBuffer();
+            printInformation();
+
+            delay(2000);
+
+            break;
     }
-    state++;
 }
+
+
