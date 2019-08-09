@@ -364,10 +364,18 @@ OneWire ds1820(eOutPinOneWire);
 
 /**
  * meassured values for potentiometer
- * (*) = calculated                           (*)                                        (*)    (*)    (*)  zero_terminated
- *                                   0xDF  0x127  0x16F  0x1BB  0x200  0x257  0x2AC  0x301  0x365
  */
-const uint16_t potiTempValues[] = {   223,   295,   367,   443,   512,   599,   684,   769,   854,  0 };
+const uint16_t potiTempValues[] = {   
+    0x13A,                    // 10°C (this value will be taken if ADC value is lower!)
+    0x172,                    // 15°C
+    0x1B9,                    // 20°C
+    0x1FE,                    // 25°C
+    0x243,                    // 30°C
+    0x290,                    // 35°C
+    0x2E0,                    // 40°C
+    0x2E0 + (0x2E0 - 0x297),  // 45°C (calculated!)
+    0
+};
 
 
 /**
@@ -651,6 +659,7 @@ uint8_t tempConversion(uint16_t adcValue, const uint16_t * const tempArray) {
         Serial.print(F("\n"));
     }
 
+    // table start temperature is 10°C, table entry step is 5°C wise
     return tempCalculation(adcValue, 10 + (5 * lowIndex), 10 + (5 * highIndex), value, nextValue);
 }
 
@@ -1295,5 +1304,3 @@ void loop() {
             break;
     }
 }
-
-
