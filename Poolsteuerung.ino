@@ -138,6 +138,16 @@
  *
  *
  *
+ *
+ * D-Sub:
+ *      Buchse      Stecker
+ *      intern      extern
+ *   
+ *     1 (RT) -(GND)- (WS) 1
+ *     2 (SW) -(+5V)- (BL) 2
+ *     6 (WS) -(D+)-- (BN) 6
+ *     7 (GN) -(D-)-- (GN) 7
+ *
  */
 
 // all following DEBUG defines are only active if DEBUG is also defined, so with DEBUG all debugging stuff can be enabled and disabled!
