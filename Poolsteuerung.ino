@@ -171,8 +171,14 @@
 #include <SSD1306Ascii.h>
 #include <SSD1306AsciiAvrI2c.h>
 
+#include <Wire.h>
+#include <RTC.h>        // supports DS3231, DS1307 and PCF8563 RTCs
+
+
 // I2C address for OLED display: 0X3C+SA0 - 0x3C or 0x3D
-#define I2C_ADDRESS 0x3C
+#define I2C_ADDRESS_OLED 0x3C
+#define I2C_ADDRESS_RTC  0x68           // not used, just for information, is hard coded!
+
 
 
 // Arduino nano pinning
@@ -209,7 +215,7 @@
 
 
 enum {
-    eMenuEntries     = 5,
+    eMenuEntries     = 6,
     eExitMenuIndex   = eMenuEntries,            // last menu entry is a general menu entry (Exit)!
     eMenuEntriesSize = 21,
 };
@@ -272,6 +278,14 @@ enum {
 
 enum { eResumableErrorThreshold = 5 };
 uint8_t resumableError = 0;                 // count errors until threshold reached
+
+
+enum {
+    ePumpModeTemperature = 0,       // pump is switched on/off temperature dependant (default mode)
+    ePumpModeOn          = 1,       // pump is ON even during night times (mode will stay active until day ends or when changed by user)        // @todo zeiten noch berücksichtigen und automatisch den mode zurück setzen!!!
+    ePumpModeOff         = 2,       // pump is OFF (mode will stay active until day ends or when changed by user)
+};
+uint8_t pumpMode = ePumpModeTemperature;
 
 
 /**
@@ -421,9 +435,102 @@ const uint16_t potiTempValues[] = {
 
 
 // OLED display object
-SSD1306AsciiAvrI2c oled;
+static SSD1306AsciiAvrI2c oled;
+
+// RTC object   
+static DS3231 RTC;
 
 
+
+/********************
+ * RTC stuff
+ ********************/
+/**
+ * RTC check and init
+ */
+void rtcInit()
+{
+  Serial.print("Is Clock Running: ");
+  if (RTC.isRunning())
+  {
+    Serial.println("Yes");
+    Serial.print(RTC.getDay());
+    Serial.print("-");
+    Serial.print(RTC.getMonth());
+    Serial.print("-");
+    Serial.print(RTC.getYear());
+    Serial.print(" ");
+    Serial.print(RTC.getHours());
+    Serial.print(":");
+    Serial.print(RTC.getMinutes());
+    Serial.print(":");
+    Serial.print(RTC.getSeconds());
+    Serial.print("");
+    if (RTC.getHourMode() == CLOCK_H12)
+    {
+      switch (RTC.getMeridiem()) {
+      case HOUR_AM:
+        Serial.print(" AM");
+        break;
+      case HOUR_PM:
+        Serial.print(" PM");
+        break;
+      }
+    }
+    Serial.println("");
+    delay(1000);
+  }
+  else
+  {
+    delay(1500);
+
+    Serial.println("No");
+    Serial.println("Setting Time");
+    //RTC.setHourMode(CLOCK_H12);
+    RTC.setHourMode(CLOCK_H24);
+    RTC.setDateTime(__DATE__, __TIME__);
+    Serial.println("New Time Set");
+    Serial.print(__DATE__);
+    Serial.print(" ");
+    Serial.println(__TIME__);
+    RTC.startClock();
+    
+    delay(1000);
+    Serial.print(RTC.getDay());
+    Serial.print("-");
+    Serial.print(RTC.getMonth());
+    Serial.print("-");
+    Serial.print(RTC.getYear());
+    Serial.print(" ");
+    Serial.print(RTC.getHours());
+    Serial.print(":");
+    Serial.print(RTC.getMinutes());
+    Serial.print(":");
+    Serial.print(RTC.getSeconds());
+    Serial.print("");
+    if (RTC.getHourMode() == CLOCK_H12)
+    {
+      switch (RTC.getMeridiem()) {
+      case HOUR_AM:
+        Serial.print(" AM");
+        break;
+      case HOUR_PM:
+        Serial.print(" PM");
+        break;
+      }
+    }
+    Serial.println("");
+    delay(1000);
+  }
+}
+
+
+
+
+
+/********************
+ * Button press stuff
+ ********************/
 enum {
     eButtonNotPressed      = 0,
     eButtonShortPressed    = 1,
@@ -488,19 +595,76 @@ uint8_t buttonPressed()
 }
 
 
-/***********************************************************************************/
-/**
- *
- */
-void printMenuExtra()
-{
-    oled.clear();
-    oled.set1X();
-    oled.println("untermenue");
-    unsigned long currentDeltaMillis = millis();
 
-    while(millis() - currentDeltaMillis < 1000);
+/********************
+ * Olm stuff
+ ********************/
+// /**
+//  * 16 bit value will be printed but filled up with given character if necessary,
+//  * e.g. (0, 3, '0') -> "000"
+//  *      (0, 3, ' ') -> "  0"
+//  *      (4, 2, '0') -> "04"
+//  *      (4, 2, ' ') -> " 4"
+//  */
+// void oledPrintValue(uint16_t value, int8_t length, char filler)
+// {
+//     if (length > 5)
+//     {
+//         length = 5;     // uint16_t values cannot have more than 5 characters
+//     }
+//     else
+//     if (length <= 0)
+//     {
+//         length = 1;     // <= 0 is not supported so start with 1
+//     }
+// 
+//     /* examples:        value    length    length    length    length    length     length->fillerLength
+//      *                      0    1 -> 0    2 -> 1    3 -> 2    4 -> 3    5 -> 4
+//      *                      1    1 -> 0    2 -> 1    3 -> 2    4 -> 3    5 -> 4
+//      *                      2    1 -> 0    2 -> 1    3 -> 2    4 -> 3    5 -> 4
+//      *                      9    1 -> 0    2 -> 1    3 -> 2    4 -> 3    5 -> 4
+//      *                     10    1 -> 0    2 -> 0    3 -> 1    4 -> 2    5 -> 3
+//      *                     11    1 -> 0    2 -> 0    3 -> 1    4 -> 2    5 -> 3
+//      *                     99    1 -> 0    2 -> 0    3 -> 1    4 -> 2    5 -> 3
+//      *                    100    1 -> 0    2 -> 0    3 -> 0    4 -> 1    5 -> 2
+//      *                    101    1 -> 0    2 -> 0    3 -> 0    4 -> 1    5 -> 2
+//      *                    999    1 -> 0    2 -> 0    3 -> 0    4 -> 1    5 -> 2
+//      *                   1000    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 1
+//      *                   1001    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 1
+//      *                   9999    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 1
+//      *                  10000    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 0
+//      *                  10001    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 0
+//      *                  65535    1 -> 0    2 -> 0    3 -> 0    4 -> 0    5 -> 0
+//      */
+// 
+//     // calculate amount of fillers to be printed
+//     uint16_t lenghtCheck = 10;
+//     while ((--length) && (value > lengthCheck))     // --length will ensure that length is decremented by 1 under any circumstances!
+//     {
+//         lengthCheck *= 10;
+//     }
+// 
+//     for (uint8_t printFiller = 0; printFiller < length; printFiller)
+//     {
+//         oled.print(filler);
+//     }
+//     
+//     oled.print(value);
+// }
+
+
+
+/**
+ * 16 bit value will be printed but filled up with given character if necessary,
+ * e.g. [0..9]   -> [00..09]
+ *      [10..99] -> [10..99]
+ */
+static inline void oledPrintValue99(uint8_t value)
+{
+    oled.print(value / 10 ? (char)(value / 10 + '0') : (char)'0');
+    oled.print(value % 10 ? (char)(value % 10 + '0') : (char)'0');
 }
+
 
 
 /**
@@ -513,8 +677,32 @@ void oledPrintTime(uint8_t timeValue, bool inverted)
         oled.setInvertMode(true);
     }
 
-    oled.print(timeValue / 10 ? (char)(timeValue / 10 + '0') : (char)'0');
-    oled.print(timeValue % 10 ? (char)(timeValue % 10 + '0') : (char)'0');
+    oledPrintValue99(timeValue);
+
+    oled.setInvertMode(false);
+}
+
+
+
+/**
+ * Expects a value between 0 and 9999 and will print it (for days usually it should be between 1 and 31, for month it should be between 1 and 12, years should be between 1000 and 9999)
+ */
+void oledPrintDate(uint16_t dateValue, bool inverted)
+{
+    if (inverted)
+    {
+        oled.setInvertMode(true);
+    }
+
+    // spread values in [0..9] since they are day or month values, year value already has 4 characters and doesn't need to be spreaded!
+    if (dateValue < 100)
+    {
+        oledPrintValue99((uint8_t)dateValue);
+    }
+    else
+    {
+        oled.print(dateValue);
+    }
 
     oled.setInvertMode(false);
 }
@@ -577,30 +765,31 @@ void enterTimeRange(char * name, uint8_t times[4])
 
 char pumpString[] = "pump on\n";
 uint8_t pumpOnTimes[4] = {
-    10,     // hour of start time
+    10,     // hour   of start time
      0,     // minute of start time
-    16,     // hour of end time
+    16,     // hour   of end time
      0      // minute of end time
 };
 char nightString[] = "pump off\n";
 uint8_t pumpOffTimes[4] = {
-    18,     // hour of start time
+    18,     // hour   of start time
      0,     // minute of start time
-     9,     // hour of end time
+     9,     // hour   of end time
      0      // minute of end time
 };
 uint8_t pumpOnTimesWinter[4] = {
-    11,     // hour of start time
+    11,     // hour   of start time
      0,     // minute of start time
-    14,     // hour of end time
+    14,     // hour   of end time
      0      // minute of end time
 };
 uint8_t pumpOffTimesWinter[4] = {
-    14,     // hour of start time
+    14,     // hour   of start time
      0,     // minute of start time
-    11,     // hour of end time
+    11,     // hour   of end time
      0      // minute of end time
 };
+bool summerTime = true;
 /**
  *
  */
@@ -629,23 +818,96 @@ void enterNightTimeWinter()
 {
     enterTimeRange(nightString, pumpOffTimesWinter);
 }
+/**
+ *
+ */
+void switchSummerWinter()
+{
+    oled.clear();
+    oled.set2X();
+
+    do
+    {
+        oled.home();
+
+        oled.println("set season:");
+        oled.setInvertMode(true);
+        oled.print(summerTime ? "summer" : "winter");
+        oled.setInvertMode(false);
+        
+        // wait for user input
+        while (!buttonPressed());
+        
+        if (lastButtonPressed == eButtonShortPressed)
+        {
+            summerTime = !summerTime;
+        }
+    } while (lastButtonPressed != eButtonLongPressed);
+}
+/**
+ *
+ */
+void enterDateTime()
+{
+    // @todo xxxxxxxxxxxx to be done
+    
+    // @todo Zeit prüfen und entsprechend setzen, dann Zeit mit bei Pumpe ein/aus berücksichtigen!!!
+}
 
 
-menu_mt startMenu = {
+menu_mt settingsMenu = {
     {
      // "123456789012345678901", no '\n'!
         "pump ON time",
         "pump OFF time",
         "winter pump ON",
-        "winter night OFF",
+        "winter pump OFF",
+        "switch summer/winter",
+        "set date/time",
     },
     {
         enterPumpTime,
         enterNightTime,
         enterPumpTimeWinter,
         enterNightTimeWinter,
+        switchSummerWinter,
+        enterDateTime,
     }
 };
+
+
+void enterSettingsMenu();
+void switchPumpModeToOn()
+{
+    pumpMode = ePumpModeOn;
+}
+void switchPumpModeToTemperatureDependent()
+{
+    pumpMode = ePumpModeTemperature;
+}
+void switchPumpModeToOff()
+{
+    pumpMode = ePumpModeOff;
+}
+
+menu_mt startMenu = {
+    {
+     // "123456789012345678901", no '\n'!
+        "pump ON",
+        "pump TEMP",
+        "pump OFF",
+        "",
+        "settings",
+    },
+    {
+        switchPumpModeToOn,
+        switchPumpModeToTemperatureDependent,
+        switchPumpModeToOff,
+        NULL,
+        enterSettingsMenu,
+    }
+};
+
 
 
 /**
@@ -717,6 +979,9 @@ void showMenu(menu_mt * menu)
 
                     // print menu since either index changed or called menu function has been left again
                     printMenu(menu, menuIndex, eMenuEntryRedraw);
+                    
+                    // user has to release button before we will go on (long press usually leaves menu point and without that wait here we will directly step through the menu)
+                    while(buttonPressed());
                 }
             }
             else
@@ -736,6 +1001,20 @@ void showMenu(menu_mt * menu)
 }
 
 
+
+/**
+ * enter settings sub menu
+ */
+void enterSettingsMenu()
+{
+    showMenu(&settingsMenu);
+}
+
+
+
+/********************
+ * application stuff
+ ********************/
 
 /**
  * Returns current error state
@@ -1230,7 +1509,7 @@ void printHelp(void) {
 /**
  * print a single line on OLED display show temperature information, e.g. "O: 14.0 C"
  */
-void printTemperatureToOled(char meaning, uint16_t temperature)
+void printTemperatureToOled(char meaning, uint16_t temperature, char extraCharacter)
 {
     uint16_t tempInt   = temperature / 100;             // part in front of decimal point
     uint16_t tempFract = temperature % 100 / 10;        // only first digit after decimal point will be shown!
@@ -1248,8 +1527,10 @@ void printTemperatureToOled(char meaning, uint16_t temperature)
     oled.print(".");                    // "X:  4."
     oled.print(tempFract);              // "X:  4.0"
 
-    oled.println(" C");                 // "X:  4.0 C"
+    oled.print(" C");                   // "X:  4.0 C"
+    oled.println(extraCharacter);
 }
+
 
 
 /**
@@ -1257,7 +1538,11 @@ void printTemperatureToOled(char meaning, uint16_t temperature)
  */
 void setup() {
     // put your setup code here, to run once:
-    Serial.begin(9600);           //  setup serial
+    Serial.begin(9600);             //  setup serial
+    
+    RTC.begin();                    // setup RTC
+    rtcInit();
+    rtcInit();
 
     // initialize debug pins
     pinMode(eInPinDebugRoof,  INPUT_PULLUP);
@@ -1277,7 +1562,7 @@ void setup() {
     // initialize input ports
     pinMode(eInPinButton,     INPUT_PULLUP);
 
-    oled.begin(&Adafruit128x64, I2C_ADDRESS);
+    oled.begin(&Adafruit128x64, I2C_ADDRESS_OLED);
     oled.setFont(Adafruit5x7);
     oled.clear();
     oled.set2X();
@@ -1601,8 +1886,8 @@ void loop() {
                 }
                 toggleLed = !toggleLed;
 
-                // pump ON?
-                if (pump) {
+                // pump ON or forced ON but not forced OFF?
+                if ((pump || (pumpMode == ePumpModeOn)) && (pumpMode != ePumpModeOff)) {
                     portStates |= eOutPump;
                 }
 
@@ -1626,11 +1911,21 @@ void loop() {
                 {
                     static uint16_t oldRoofTemp  = 0;
                     static uint16_t oldWaterTemp = 0;
+                    static uint8_t  oldSeconds   = 99;
+                    static uint16_t oldTempSet   = 0;
 
                     static unsigned long lastDeltaMillis = 0;            // it can happen that shown value is wrong for the first time but all following loop runs will be fine!
                     static unsigned long delta = 0;
                     unsigned long currentDeltaMillis = millis();
 
+                    // if user changed set temperature show display
+                    if (oldTempSet != tempSet)
+                    {
+                        oldTempSet = tempSet;
+                        switchOledOn();
+                    }
+
+                    // if oled should be printed, print it!
                     if (oledPrint)
                     {
                         if (millis() - oledPrintMillis > 5000)
@@ -1638,30 +1933,30 @@ void loop() {
                             oledPrint = false;
                         }
 
-                        if ((oldRoofTemp != sensorTemp[eSensorIndexRoof]) || (oldWaterTemp != sensorTemp[eSensorIndexWater]) || ((currentDeltaMillis - lastDeltaMillis) != delta))
+                        uint8_t newSeconds = RTC.getSeconds();
+
+                        if ((oldRoofTemp != sensorTemp[eSensorIndexRoof]) || (oldWaterTemp != sensorTemp[eSensorIndexWater]) || ((currentDeltaMillis - lastDeltaMillis) != delta) || (oldSeconds != newSeconds))
                         {
                             delta = currentDeltaMillis - lastDeltaMillis;
                             oldRoofTemp  = sensorTemp[eSensorIndexRoof];
                             oldWaterTemp = sensorTemp[eSensorIndexWater];
+                            oldSeconds   = newSeconds;
 
                             oled.home();        // no clear, just go home but ensure that whole display will be filled to overwrite old stuff... so flickering will be suppressed!
                             oled.set2X();
 
                             // line 1
-                            printTemperatureToOled('O', sensorTemp[eSensorIndexRoof]);
+                            printTemperatureToOled('R', sensorTemp[eSensorIndexRoof], ' ');
 
                             // line 2
-                            printTemperatureToOled('U', sensorTemp[eSensorIndexWater]);
+                            printTemperatureToOled('W', sensorTemp[eSensorIndexWater], ' ');
 
                             // line 3
-                            printTemperatureToOled('S', tempSet);
+                            printTemperatureToOled('S', tempSet, pumpMode == ePumpModeOff ? '-' : pumpMode == ePumpModeOn ? '+' : ' ');
 
                             oled.set1X();
                             // line 4
-                            oled.println("                      ");
-//                            oled.println(delta);
 
-                            // line 5
                             if (heatCool == eHeatStateMatch)
                             {
                                 oled.print("match");
@@ -1677,9 +1972,28 @@ void loop() {
                                 oled.print("heat");
                             }
                             oled.print(" | ");
-                            oled.print(pump ? "ON" : "OFF");
+                            oled.print((portStates & eOutPump) ? "ON" : "OFF");                 // show real port state not temperature dependant pump state!
                             oled.print((portStates & eLedFrost) ? "| freez" : "       ");
                             oled.println("          ");
+//                            oled.println(delta);
+
+
+                            // line 5
+                            if (RTC.isRunning())
+                            {
+                                oledPrintValue99(RTC.getDay());
+                                oled.print('-');
+                                oledPrintValue99(RTC.getMonth());
+                                oled.print('-');
+                                oled.print(RTC.getYear());
+                                oled.print(' ');
+                                oledPrintValue99(RTC.getHours());
+                                oled.print(':');
+                                oledPrintValue99(RTC.getMinutes());
+                                oled.print(':');
+                                oledPrintValue99(RTC.getSeconds());
+                                oled.println("            ");
+                            }
                         }
 
                     }
