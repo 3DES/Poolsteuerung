@@ -1539,6 +1539,8 @@ void printTemperatureToOled(char meaning, uint16_t temperature, char extraCharac
 void setup() {
     // put your setup code here, to run once:
     Serial.begin(9600);             //  setup serial
+
+    Serial.println("firmware version 4");
     
     Serial.println("setup RTC");
     RTC.begin();                    // setup RTC
