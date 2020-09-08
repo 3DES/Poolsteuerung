@@ -160,7 +160,7 @@
  */
 
 // all following DEBUG defines are only active if DEBUG is also defined, so with DEBUG all debugging stuff can be enabled and disabled!
-#define DEBUG                   // define for DEBUG enabled
+//#define DEBUG                   // define for DEBUG enabled
 #define SENSOR_FOUND            // define to simulate sensors even if none is connected
 #define TEMPERATURE_READ        // define to simulate sensor temperature read even if no sensor has been connected
 #define TEMPERATURE_SET         // define to simulate potentiometer read even if no potentiometer has been connected
@@ -390,7 +390,7 @@ enum {
 };
 
 
-// expected 1-wire sensors
+// expected 1-wire sensors      // @todo adressen hartcodiert, suchen wäre möglich und dann über Display einstellen...
 const uint8_t sensorAddresses[2][8] = {
     { 0x28, 0xB2, 0xB7, 0x26, 0x00, 0x00, 0x80, 0x9C },         // roof  sensor
     { 0x28, 0xFF, 0x21, 0x4F, 0x54, 0x14, 0x00, 0x35 }          // water sensor
@@ -1540,9 +1540,13 @@ void setup() {
     // put your setup code here, to run once:
     Serial.begin(9600);             //  setup serial
     
+    Serial.println("setup RTC");
     RTC.begin();                    // setup RTC
+    Serial.println("init RTC");
     rtcInit();
     rtcInit();
+
+    Serial.println("setup pininng");
 
     // initialize debug pins
     pinMode(eInPinDebugRoof,  INPUT_PULLUP);
@@ -1561,6 +1565,8 @@ void setup() {
 
     // initialize input ports
     pinMode(eInPinButton,     INPUT_PULLUP);
+
+    Serial.println("setup OLED");
 
     oled.begin(&Adafruit128x64, I2C_ADDRESS_OLED);
     oled.setFont(Adafruit5x7);
