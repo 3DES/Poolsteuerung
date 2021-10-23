@@ -3,18 +3,20 @@
  *   - Werte der pump-/nicht-pump-Zeiten noch im EEPROM speichern
  *   - DCF77 support, da sonst Uhrzeit und Datum nicht klar sind
  *   - Pump-Zeiten werden auch generell noch nicht berücksichtigt, aktuell läuft alles nur über die Temperatur
- *
- *
- *
+ *   - RTC einstellbar machen, da die RTC Batterie über den Winter leer ist... -> keine Batterie mehr, dafür 1x im Frühjahr Uhrzeit und Datum einstellen
+ *   - Auswahl, welcher der beiden 1-wire Sensoren zum Dach gehört, der andere ist dann automatisch für unten
+ *   - bei strom-ein wird nach 1-wire Sensoren gesucht, hier dann künftig besser suchen und mit EEPROM vergleichen, und, falls was nicht stimmt, User auswählen lassen, welcher Sensor wofür ist...
+ *   - während Menü aktiv ist scheint die normale state machine deaktiviert zu sein... muß das so sein wegen Reaktionszeit? Ansonsten könnte man das ggf. auch im normalen state behandeln, so daß die state machine (bis auf Ausnahmen in denen das Menü in einer while() hängt, die state machine weiterhin behandelt wird
+ *     - alternativ könnte man auch, wenn für wenige Sekunden keine Eingabe mehr erfolgt, das Menü automatisch verlassen
+ *   - zu long und short pressed vielleicht noch sowas wie "gehalten" einbauen, so daß nicht für jede Änderung 1x gedrückt werden muß, sondern die Auswahl zu "laufen" beginnt bis Button losgelassen wird
+ *     - da Routine nicht interruptgesteuert ist sondern Button einfach nur auswertet, wenn sie aufgerufen wird, ist das nur schwer möglich
+ *       - wir benötigen vermutlich noch ein Zeitfenster, kurz=100-1000 Sekunden, lang=1000-2000 Sekunden, sehr lang>2000 Sekunden
+ *       - wir benötigen dabei Unterstützung vom Aufrufer, welcher mitteilen kann ob letzter Druck "sehr lang" war, dann kann man, falls gedrückt min. 100ms-200ms (testen, soll ja bedienbar bleiben) ist, ein weiteres "sehr lang" absetzen, und falls nicht gedrückt ein eButtonNotPressed, somit können Menüs "lang" und "sehr lang" als "lang" auswerten und Auswahlfelder ein "sehr lang" zum durchlaufen der möglichen Zahlen verwenden
+ *     - theoretisch wäre auch Doppelklick möglich, dann müßte man nach erkennen von "kurz" nochmal 100ms warten ob noch ein Klick kommt, falls nicht, dann war das ein "kurz", falls schon, dann war das ein "doppelt"
+ *       - menüs könnten dann "lang", "sehr lang" und "doppelt" als "lang" verarbeiten, alle anderen könnten spezieller auswerten
  *
  *
  * Simple pool control for arduino nano
- *
- * 1-wire support only for adjustment
- * During startup it will search for such a sensor and if exist it will print its current value in state machine, that's all!
- * The values can be used to calculate proper adjustment values for the 5k NTCs
- * onewire: www.netzmafia.de/skripten/hardware/Adruino/Onewire/index.html
- *
  *
  * LEDs and meaning
  *    heat | match | cool |    situation
@@ -27,7 +29,7 @@
  *
  *      voltage divider                potentiometer                                 LEDs                                          pump + heater valve                                  1-wire sensors
  *        roof/water                     temp set                                                                                                                                       used cable is a 3x1,5 JFLEX ([1], [2] and [GG] are the single wires!)
- *
+ *        (original)
  *            5V                            5V                                    1k5                                                 VCC         ~24V         L(230V)                    VCC [1]
  *            +                              +                                    ___    LED                                           +            +             +                        +
  *            |                              |                            VCC +--|___|---|>|-----+ uC                                  |            |             |                        |
@@ -204,9 +206,9 @@
 // #define D18 18              // also A4 in case of ADC
 // #define D19 19              // also A5 in case of ADC
 
-#define A0  0               // roof   temperature
-#define A1  1               // wather temperature
-#define A2  2               // set    temperature
+#define A0  0               // set    temperature
+#define A1  1               // 
+#define A2  2               // 
 #define A3  3               //
 #define A4  4               // I2C SDA
 #define A5  5               // I2C SCL
@@ -292,12 +294,12 @@ uint8_t pumpMode = ePumpModeTemperature;
  * states for loop state machine
  */
 enum {
-    eStateInitial        = 0,
-    eStateSamplePhase,
-    eStateMedian,
-    eStateConversion,
-    eStateOneWire,
-    eStateAction,
+    eStateInitial        = 0,       // search 1-wire sensors
+    eStateSamplePhase,              // read analog value from potentiometer
+    eStateMedian,                   // calculate median for potentiometer ADC value
+    eStateConversion,               // convert potentiometer ADC value into temperature value
+    eStateOneWire,                  // do 1-wire handling (see sub state machine in state eStateOneWire)
+    eStateAction,                   // now with all the values, decide what to do (heating, cooling, ...)
     eStateOled,
     eStateButtonPressed,
     eStatePrint,
@@ -853,25 +855,35 @@ void enterDateTime()
     
     // @todo Zeit prüfen und entsprechend setzen, dann Zeit mit bei Pumpe ein/aus berücksichtigen!!!
 }
+/**
+ *
+ */
+void setRoofSensor()
+{
+    // @todo xxxxxxxxxxxx to be done
+    
+    // @todo Auswahl, welcher der beiden gefundenen Sensoren ist der Dach-Sensor...
+}
 
 
-menu_mt settingsMenu = {
+
+const menu_mt settingsMenu = {
     {
      // "123456789012345678901", no '\n'!
         "pump ON time",
         "pump OFF time",
         "winter pump ON",
         "winter pump OFF",
-        "switch summer/winter",
         "set date/time",
+        "set roof sensor",
     },
     {
         enterPumpTime,
         enterNightTime,
         enterPumpTimeWinter,
         enterNightTimeWinter,
-        switchSummerWinter,
         enterDateTime,
+        setRoofSensor,
     }
 };
 
@@ -890,12 +902,13 @@ void switchPumpModeToOff()
     pumpMode = ePumpModeOff;
 }
 
-menu_mt startMenu = {
+const menu_mt startMenu = {
     {
      // "123456789012345678901", no '\n'!
         "pump ON",
         "pump TEMP",
         "pump OFF",
+        "switch summer/winter",
         "",
         "settings",
     },
@@ -903,6 +916,7 @@ menu_mt startMenu = {
         switchPumpModeToOn,
         switchPumpModeToTemperatureDependent,
         switchPumpModeToOff,
+        switchSummerWinter,
         NULL,
         enterSettingsMenu,
     }
@@ -914,7 +928,7 @@ menu_mt startMenu = {
  * print a given menu structure adding an extra menu entry "Exit" at the end and adding a ">" character in front of selected index.
  * In case user just switches through the menu parameter "redraw" should be false to prevent flickering, when a new menu has to be printed "redraw" should be set to true so the screen is cleared at the beginning
  */
-void printMenu(menu_mt * menu, uint8_t menuIndex, bool redraw)
+void printMenu(menu_mt * const menu, uint8_t menuIndex, bool redraw)
 {
     oled.set1X();
 
@@ -952,7 +966,7 @@ void printMenu(menu_mt * menu, uint8_t menuIndex, bool redraw)
 /**
  * Handles a given menu strucutre, elements can be selected (auto-repeat is supported by pressing the button for a long time), menu elements can be executed
  */
-void showMenu(menu_mt * menu)
+void showMenu(menu_mt * const menu)
 {
     uint8_t menuIndex = 0;
     bool    leaveMenu = false;
@@ -2172,7 +2186,7 @@ void loop() {
         // leave menu
         menuMode = false;
 
-        // ensure default menu will be printed some secons after leaving menu...
+        // ensure default menu will be printed for some more secons after leaving menu...
         switchOledOn();
     }
 }
